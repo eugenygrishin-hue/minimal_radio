@@ -5,3 +5,5 @@ sdkconfig.old
 .vscode/
 .DS_Store.cproject
 .project
+.cproject
+.DS_Store
