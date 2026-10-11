@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "esp_gmf_radio.cpp"
+        "config.cpp"
+        "storage_manager.cpp"
+        "wifi_manager.cpp"
+        "http_stream.cpp"
+        "audio_player.cpp"
+        "ui_manager.cpp"
+        "sd_manager.cpp"
+        "catalog_manager.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp_driver_spi
+        esp_driver_sdmmc
+        fatfs
+        vfs
+        json
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_http_client
+        esp-libhelix-mp3
+        M5Unified
+        mbedtls
+)
