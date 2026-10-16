@@ -1195,12 +1195,13 @@ void ui_update() {
     }
 
     // ========================================================
-    // 5. Энкодер: ВРАЩЕНИЕ (накопитель и порог)
+    // 5. Энкодер: ВРАЩЕНИЕ
     // ========================================================
     if (increment != 0) {
         s_encoder_accumulator += increment;
 
         int32_t effective = 0;
+
         if (s_encoder_accumulator >= ENCODER_THRESHOLD) {
             effective = s_encoder_accumulator / ENCODER_THRESHOLD;
             s_encoder_accumulator %= ENCODER_THRESHOLD;
@@ -1209,94 +1210,183 @@ void ui_update() {
             s_encoder_accumulator %= ENCODER_THRESHOLD;
         }
 
-        if (s_current_mode == MODE_CATEGORIES) {
-            int cat_count = (int)catalog_category_count();
-            s_selected_category += effective;
-            if (s_selected_category < 0) s_selected_category = 0;
-            if (cat_count > 0 && s_selected_category >= cat_count) s_selected_category = cat_count - 1;
-            ui_needs_redraw = true;
-        }
-        else if (s_current_mode == MODE_STATIONS) {
-            const catalog_category_t* ec = catalog_get_category(s_selected_category);
-            int count = ec ? (int)ec->count : 0;
-            s_ui_station_idx += effective;
-            if (s_ui_station_idx < 0) s_ui_station_idx = 0;
-            if (count > 0 && s_ui_station_idx >= count) s_ui_station_idx = count - 1;
-            ui_needs_redraw = true;
-        }
-        else if (s_current_mode == MODE_FAVORITES) {
-            int fav_count = (int)catalog_get_favorites_count();
-            s_fav_station_idx += effective;
-            if (s_fav_station_idx < 0) s_fav_station_idx = 0;
-            if (fav_count > 0 && s_fav_station_idx >= fav_count) s_fav_station_idx = fav_count - 1;
-            ui_needs_redraw = true;
-        }
-        else if (s_current_mode == MODE_SETTINGS) {
-            s_settings_idx += effective;
-            if (s_settings_idx < 0) s_settings_idx = 0;
-            if (s_settings_idx >= 4) s_settings_idx = 3;
-            ui_needs_redraw = true;
-        }
-        else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
-            if (s_wifi_show_scan_results) {
-                // ✅ ТОЛЬКО НАВИГАЦИЯ по списку найденных сетей при вращении
-                int count = wifi_scan_get_count();
-                s_wifi_scan_selected_idx += effective;
-                if (s_wifi_scan_selected_idx < 0) s_wifi_scan_selected_idx = 0;
-                if (count > 0 && s_wifi_scan_selected_idx >= count) s_wifi_scan_selected_idx = count - 1;
-            } else {
-                // ✅ ТОЛЬКО НАВИГАЦИЯ по полям: 0=SSID, 1=PASS, 2=Scan, 3=Connect
-                s_wifi_focus += effective;
-                if (s_wifi_focus < 0) s_wifi_focus = 0;
-                if (s_wifi_focus > 3) s_wifi_focus = 3;
-            }
-            ui_needs_redraw = true;
-        }
-                if (s_wifi_focus < 0) s_wifi_focus = 0;
-                if (s_wifi_focus > 3) s_wifi_focus = 3;
-            }
-            ui_needs_redraw = true;
-        }
-        else if (s_current_mode == MODE_VOLUME || s_current_mode == MODE_PLAYBACK) {
-            int new_vol = s_current_volume + effective * 5;
-            if (new_vol < 0) new_vol = 0;
-            if (new_vol > 100) new_vol = 100;
-            if (new_vol != s_current_volume) {
-                s_current_volume = new_vol;
-                s_new_volume = new_vol;
-                s_pending_event = UI_EVENT_VOLUME_CHANGED;
+        if (effective != 0) {
+            if (s_current_mode == MODE_CATEGORIES) {
+                int cat_count = (int)catalog_category_count();
+                s_selected_category += effective;
+
+                if (s_selected_category < 0) s_selected_category = 0;
+                if (cat_count > 0 && s_selected_category >= cat_count) {
+                    s_selected_category = cat_count - 1;
+                }
+
                 ui_needs_redraw = true;
+            }
+            else if (s_current_mode == MODE_STATIONS) {
+                const catalog_category_t* ec = catalog_get_category(s_selected_category);
+                int count = ec ? (int)ec->count : 0;
+
+                s_ui_station_idx += effective;
+
+                if (s_ui_station_idx < 0) s_ui_station_idx = 0;
+                if (count > 0 && s_ui_station_idx >= count) {
+                    s_ui_station_idx = count - 1;
+                }
+
+                ui_needs_redraw = true;
+            }
+            else if (s_current_mode == MODE_FAVORITES) {
+                int fav_count = (int)catalog_get_favorites_count();
+
+                s_fav_station_idx += effective;
+
+                if (s_fav_station_idx < 0) s_fav_station_idx = 0;
+                if (fav_count > 0 && s_fav_station_idx >= fav_count) {
+                    s_fav_station_idx = fav_count - 1;
+                }
+
+                ui_needs_redraw = true;
+            }
+            else if (s_current_mode == MODE_SETTINGS) {
+                s_settings_idx += effective;
+
+                if (s_settings_idx < 0) s_settings_idx = 0;
+                if (s_settings_idx >= 4) s_settings_idx = 3;
+
+                ui_needs_redraw = true;
+            }
+            else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
+                if (s_wifi_show_scan_results) {
+                    int count = wifi_scan_get_count();
+
+                    if (count > 0) {
+                        if (s_wifi_scan_selected_idx < 0) {
+                            s_wifi_scan_selected_idx = 0;
+                        }
+
+                        s_wifi_scan_selected_idx += effective;
+
+                        if (s_wifi_scan_selected_idx < 0) {
+                            s_wifi_scan_selected_idx = 0;
+                        }
+
+                        if (s_wifi_scan_selected_idx >= count) {
+                            s_wifi_scan_selected_idx = count - 1;
+                        }
+                    } else {
+                        s_wifi_scan_selected_idx = -1;
+                    }
+                } else {
+                    // 0 = SSID, 1 = Password, 2 = Scan, 3 = Connect
+                    s_wifi_focus += effective;
+
+                    if (s_wifi_focus < 0) s_wifi_focus = 0;
+                    if (s_wifi_focus > 3) s_wifi_focus = 3;
+                }
+
+                ui_needs_redraw = true;
+            }
+            else if (s_current_mode == MODE_VOLUME || s_current_mode == MODE_PLAYBACK) {
+                int new_vol = s_current_volume + effective * 5;
+
+                if (new_vol < 0) new_vol = 0;
+                if (new_vol > 100) new_vol = 100;
+
+                if (new_vol != s_current_volume) {
+                    s_current_volume = new_vol;
+                    s_new_volume = new_vol;
+                    s_pending_event = UI_EVENT_VOLUME_CHANGED;
+                    ui_needs_redraw = true;
+                }
             }
         }
     }
 
     // ========================================================
-    // 6. Кнопка A (навигация назад)
+    // 6. Кнопка A: назад / отмена
     // ========================================================
     if (btn_a_edge) {
         if (s_current_mode == MODE_WIFI) {
-            s_current_mode = MODE_SETTINGS;
-            s_wifi_show_scan_results = false;
-            s_wifi_scan_selected_idx = -1;
+            if (s_keyboard_active) {
+                s_keyboard_active = false;
+                s_keyboard_target = KB_TARGET_NONE;
+            }
+            else if (s_wifi_show_scan_results) {
+                s_wifi_show_scan_results = false;
+                s_wifi_scan_selected_idx = -1;
+                s_wifi_focus = 0;
+            }
+            else {
+                s_current_mode = MODE_SETTINGS;
+                s_wifi_focus = 0;
+                s_keyboard_active = false;
+                s_keyboard_target = KB_TARGET_NONE;
+            }
         }
-        else if (s_current_mode == MODE_STATIONS) s_current_mode = MODE_CATEGORIES;
-        else if (s_current_mode == MODE_CATEGORIES) s_current_mode = MODE_FAVORITES;
-        else if (s_current_mode == MODE_FAVORITES) s_current_mode = MODE_PLAYBACK;
-        else if (s_current_mode == MODE_SETTINGS) s_current_mode = MODE_PLAYBACK;
-        else if (s_current_mode == MODE_PLAYBACK) s_current_mode = MODE_SETTINGS;
+        else if (s_current_mode == MODE_PLAYBACK) {
+            s_current_mode = MODE_SETTINGS;
+        }
+        else if (s_current_mode == MODE_SETTINGS) {
+            s_current_mode = MODE_STATIONS;
+        }
+        else if (s_current_mode == MODE_STATIONS) {
+            s_current_mode = MODE_CATEGORIES;
+        }
+        else if (s_current_mode == MODE_CATEGORIES) {
+            s_current_mode = MODE_FAVORITES;
+        }
+        else if (s_current_mode == MODE_FAVORITES) {
+            s_current_mode = MODE_PLAYBACK;
+        }
+        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
+            s_current_mode = MODE_SETTINGS;
+        }
 
         s_encoder_accumulator = 0;
         ui_needs_redraw = true;
     }
     last_btn_a = btn_a;
 
-    // Кнопка B (вперёд)
+    // ========================================================
+    // 7. Кнопка B: вперёд
+    //    В Wi-Fi тоже делаем безопасный выход, чтобы не было ловушки.
+    // ========================================================
     if (btn_b_edge) {
-        if (s_current_mode == MODE_PLAYBACK) s_current_mode = MODE_FAVORITES;
-        else if (s_current_mode == MODE_FAVORITES) s_current_mode = MODE_CATEGORIES;
-        else if (s_current_mode == MODE_CATEGORIES) s_current_mode = MODE_STATIONS;
-        else if (s_current_mode == MODE_STATIONS) s_current_mode = MODE_SETTINGS;
-        else if (s_current_mode == MODE_SETTINGS) s_current_mode = MODE_PLAYBACK;
+        if (s_current_mode == MODE_WIFI) {
+            if (s_keyboard_active) {
+                s_keyboard_active = false;
+                s_keyboard_target = KB_TARGET_NONE;
+            }
+            else if (s_wifi_show_scan_results) {
+                s_wifi_show_scan_results = false;
+                s_wifi_scan_selected_idx = -1;
+                s_wifi_focus = 0;
+            }
+            else {
+                s_current_mode = MODE_SETTINGS;
+                s_wifi_focus = 0;
+                s_keyboard_active = false;
+                s_keyboard_target = KB_TARGET_NONE;
+            }
+        }
+        else if (s_current_mode == MODE_PLAYBACK) {
+            s_current_mode = MODE_FAVORITES;
+        }
+        else if (s_current_mode == MODE_FAVORITES) {
+            s_current_mode = MODE_CATEGORIES;
+        }
+        else if (s_current_mode == MODE_CATEGORIES) {
+            s_current_mode = MODE_STATIONS;
+        }
+        else if (s_current_mode == MODE_STATIONS) {
+            s_current_mode = MODE_SETTINGS;
+        }
+        else if (s_current_mode == MODE_SETTINGS) {
+            s_current_mode = MODE_PLAYBACK;
+        }
+        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
+            s_current_mode = MODE_SETTINGS;
+        }
 
         s_encoder_accumulator = 0;
         ui_needs_redraw = true;
@@ -1304,21 +1394,22 @@ void ui_update() {
     last_btn_b = btn_b;
 
     // ========================================================
-    // 7. Кнопка энкодера (нажатие / долгое нажатие)
+    // 8. Кнопка энкодера: короткое и долгое нажатие
     // ========================================================
     if (btn_enc) {
         if (!enc_is_pressed) {
             enc_is_pressed = true;
             enc_press_start_time = esp_timer_get_time() / 1000;
             s_encoder_accumulator = 0;
-            enc_long_press_handled = false; // Сбрасываем флаг при новом нажатии
+            enc_long_press_handled = false;
         } else {
             uint32_t now = esp_timer_get_time() / 1000;
-            // Долгое нажатие (>= 1000 мс)
+
             if (now - enc_press_start_time >= 1000 && !enc_long_press_handled) {
                 if (s_current_mode == MODE_STATIONS) {
                     int global_idx = catalog_global_index(s_selected_category, s_ui_station_idx);
                     const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
+
                     if (st != nullptr) {
                         bool added = catalog_toggle_favorite(st->id);
                         catalog_save_favorites();
@@ -1328,12 +1419,15 @@ void ui_update() {
                 else if (s_current_mode == MODE_FAVORITES) {
                     int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
                     const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
+
                     if (st != nullptr) {
                         bool added = catalog_toggle_favorite(st->id);
                         catalog_save_favorites();
                         ESP_LOGI(TAG, "Favorite %s: %s", added ? "ADDED" : "REMOVED", st->name);
+
                         if (!added) {
                             int fav_count = (int)catalog_get_favorites_count();
+
                             if (s_fav_station_idx >= fav_count && fav_count > 0) {
                                 s_fav_station_idx = fav_count - 1;
                             } else if (fav_count == 0) {
@@ -1342,18 +1436,36 @@ void ui_update() {
                         }
                     }
                 }
+                else if (s_current_mode == MODE_WIFI) {
+                    // Долгое нажатие в Wi-Fi = безопасный выход/отмена
+                    if (s_keyboard_active) {
+                        s_keyboard_active = false;
+                        s_keyboard_target = KB_TARGET_NONE;
+                    }
+                    else if (s_wifi_show_scan_results) {
+                        s_wifi_show_scan_results = false;
+                        s_wifi_scan_selected_idx = -1;
+                        s_wifi_focus = 0;
+                    }
+                    else {
+                        s_current_mode = MODE_SETTINGS;
+                        s_wifi_focus = 0;
+                        s_keyboard_active = false;
+                        s_keyboard_target = KB_TARGET_NONE;
+                    }
+                }
                 else {
-                    // Во всех остальных режимах долгое нажатие = MUTE
+                    // В остальных режимах долгое нажатие = MUTE
                     s_is_muted = !s_is_muted;
                     s_pending_event = UI_EVENT_MUTE_TOGGLED;
                 }
-                enc_long_press_handled = true; // ✅ Отмечаем, что долгое нажатие обработано
+
+                enc_long_press_handled = true;
                 ui_needs_redraw = true;
             }
         }
     } else {
         if (enc_is_pressed) {
-            // Короткое нажатие (отпускание) - только если долгое НЕ было обработано
             if (!enc_long_press_handled) {
                 if (s_current_mode == MODE_STATIONS) {
                     s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
@@ -1362,6 +1474,7 @@ void ui_update() {
                 }
                 else if (s_current_mode == MODE_FAVORITES) {
                     int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
+
                     if (global_idx >= 0) {
                         s_new_station_idx = global_idx;
                         s_pending_event = UI_EVENT_STATION_CHANGED;
@@ -1372,215 +1485,90 @@ void ui_update() {
                     s_current_mode = MODE_STATIONS;
                     s_ui_station_idx = 0;
                 }
+                else if (s_current_mode == MODE_SETTINGS) {
+                    if (s_settings_idx == 0) {
+                        s_current_mode = MODE_WIFI;
+                        s_wifi_focus = 0;
+                        s_keyboard_active = false;
+                        s_keyboard_target = KB_TARGET_NONE;
+                        s_wifi_show_scan_results = false;
+                        s_wifi_scan_selected_idx = -1;
+                    }
+                    else if (s_settings_idx == 1) {
+                        s_current_mode = MODE_CATALOG;
+                    }
+                    else if (s_settings_idx == 2) {
+                        s_current_mode = MODE_ABOUT;
+                    }
+                    else if (s_settings_idx == 3) {
+                        s_current_mode = MODE_PLAYBACK;
+                    }
+                }
+                else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
+                    s_current_mode = MODE_SETTINGS;
+                }
                 else if (s_current_mode == MODE_WIFI) {
                     if (s_wifi_show_scan_results) {
-                        // Выбор сети из списка сканирования
-                        if (s_wifi_scan_selected_idx >= 0) {
-                            const wifi_scan_record_t* rec = wifi_scan_get_record(s_wifi_scan_selected_idx);
-                            if (rec) {
-                                strncpy(s_wifi_ssid, rec->ssid, sizeof(s_wifi_ssid) - 1);
-                                s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
-                                s_wifi_show_scan_results = false;
-                                s_wifi_focus = 1; // Переводим фокус на пароль
-                                ESP_LOGI(TAG, "Wi-Fi SSID selected from scan: %s", s_wifi_ssid);
+                        int count = wifi_scan_get_count();
+
+                        if (count > 0) {
+                            if (s_wifi_scan_selected_idx < 0) {
+                                s_wifi_scan_selected_idx = 0;
                             }
+
+                            if (s_wifi_scan_selected_idx >= 0 && s_wifi_scan_selected_idx < count) {
+                                const wifi_scan_record_t* rec = wifi_scan_get_record(s_wifi_scan_selected_idx);
+
+                                if (rec != nullptr) {
+                                    strncpy(s_wifi_ssid, rec->ssid, sizeof(s_wifi_ssid) - 1);
+                                    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+
+                                    s_wifi_show_scan_results = false;
+                                    s_wifi_scan_selected_idx = -1;
+                                    s_wifi_focus = 1;
+
+                                    // Сразу открываем ввод пароля
+                                    s_keyboard_active = true;
+                                    s_keyboard_target = KB_TARGET_PASS;
+
+                                    ESP_LOGI(TAG, "Wi-Fi SSID selected from scan: %s", s_wifi_ssid);
+                                }
+                            }
+                        } else {
+                            // Нет сетей — переходим в ручной ввод SSID
+                            s_wifi_show_scan_results = false;
+                            s_wifi_scan_selected_idx = -1;
+                            s_wifi_focus = 0;
+                            s_keyboard_active = true;
+                            s_keyboard_target = KB_TARGET_SSID;
                         }
-                    } else if (!s_keyboard_active) {
-                        // Активация поля ввода или кнопки
+                    }
+                    else if (s_keyboard_active) {
+                        // Повторный клик закрывает клавиатуру
+                        s_keyboard_active = false;
+                        s_keyboard_target = KB_TARGET_NONE;
+                    }
+                    else {
                         if (s_wifi_focus == 0) {
                             s_keyboard_active = true;
                             s_keyboard_target = KB_TARGET_SSID;
-                        } else if (s_wifi_focus == 1) {
+                        }
+                        else if (s_wifi_focus == 1) {
                             s_keyboard_active = true;
                             s_keyboard_target = KB_TARGET_PASS;
-                        } else if (s_wifi_focus == 2) {
+                        }
+                        else if (s_wifi_focus == 2) {
                             ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
                             ui_trigger_wifi_scan();
-                        } else if (s_wifi_focus == 3) {
+                        }
+                        else if (s_wifi_focus == 3) {
                             ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
                             ui_trigger_wifi_connect();
                         }
                     }
                 }
-                else if (s_current_mode == MODE_SETTINGS) {
-                    if (s_settings_idx == 0) s_current_mode = MODE_WIFI;
-                    else if (s_settings_idx == 1) s_current_mode = MODE_CATALOG;
-                    else if (s_settings_idx == 2) s_current_mode = MODE_ABOUT;
-                    else if (s_settings_idx == 3) s_current_mode = MODE_PLAYBACK;
-                }
-                else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
-                    s_current_mode = MODE_SETTINGS;
-                }
             }
-            enc_is_pressed = false;
-            s_encoder_accumulator = 0;
-            ui_needs_redraw = true;
-        }
-    }
-    // ========================================================
-    // 6. Кнопка A (навигация назад / влево)
-    // ========================================================
-    if (btn_a_edge) {
-        if (s_current_mode == MODE_WIFI) {
-            s_current_mode = MODE_SETTINGS;
-            s_wifi_show_scan_results = false;
-            s_wifi_scan_selected_idx = -1;
-            s_keyboard_active = false; // Гарантированно закрываем клавиатуру при выходе
-        }
-        else if (s_current_mode == MODE_PLAYBACK) s_current_mode = MODE_SETTINGS;
-        else if (s_current_mode == MODE_SETTINGS) s_current_mode = MODE_STATIONS;
-        else if (s_current_mode == MODE_STATIONS) s_current_mode = MODE_CATEGORIES;
-        else if (s_current_mode == MODE_CATEGORIES) s_current_mode = MODE_FAVORITES;
-        else if (s_current_mode == MODE_FAVORITES) s_current_mode = MODE_PLAYBACK;
-        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
-            s_current_mode = MODE_SETTINGS;
-        }
-        s_encoder_accumulator = 0;
-        ui_needs_redraw = true;
-    }
-    last_btn_a = btn_a;
 
-    // ========================================================
-    // 7. Кнопка B (навигация вперед / вправо)
-    // ========================================================
-    if (btn_b_edge) {
-        if (s_current_mode == MODE_PLAYBACK) s_current_mode = MODE_FAVORITES;
-        else if (s_current_mode == MODE_FAVORITES) s_current_mode = MODE_CATEGORIES;
-        else if (s_current_mode == MODE_CATEGORIES) s_current_mode = MODE_STATIONS;
-        else if (s_current_mode == MODE_STATIONS) s_current_mode = MODE_SETTINGS;
-        else if (s_current_mode == MODE_SETTINGS) s_current_mode = MODE_PLAYBACK;
-        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
-            s_current_mode = MODE_SETTINGS;
-        }
-        s_encoder_accumulator = 0;
-        ui_needs_redraw = true;
-    }
-    last_btn_b = btn_b;
-
-    // ========================================================
-    // 8. Кнопка энкодера (клик / долгое нажатие)
-    // ========================================================
-    if (btn_enc) {
-        if (!enc_is_pressed) {
-            enc_is_pressed = true;
-            enc_press_start_time = esp_timer_get_time() / 1000;
-            s_encoder_accumulator = 0;
-            enc_long_press_handled = false; // Сбрасываем флаг при новом нажатии
-        } else {
-            uint32_t now = esp_timer_get_time() / 1000;
-            if (now - enc_press_start_time >= 1000 && !enc_long_press_handled) {
-                if (s_current_mode == MODE_STATIONS) {
-                    // Долгое нажатие в STA: добавление в избранное
-                    int global_idx = catalog_global_index(s_selected_category, s_ui_station_idx);
-                    const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
-                    if (st != nullptr) {
-                        bool added = catalog_toggle_favorite(st->id);
-                        catalog_save_favorites();
-                        ESP_LOGI(TAG, "Favorite %s: %s", added ? "ADDED" : "REMOVED", st->name);
-                    }
-                }
-                else if (s_current_mode == MODE_FAVORITES) {
-                    // Долгое нажатие в FAV: удаление из избранного
-                    int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
-                    const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
-                    if (st != nullptr) {
-                        bool added = catalog_toggle_favorite(st->id);
-                        catalog_save_favorites();
-                        ESP_LOGI(TAG, "Favorite %s: %s", added ? "ADDED" : "REMOVED", st->name);
-
-                        if (!added) {
-                            int fav_count = (int)catalog_get_favorites_count();
-                            if (s_fav_station_idx >= fav_count && fav_count > 0) {
-                                s_fav_station_idx = fav_count - 1;
-                            } else if (fav_count == 0) {
-                                s_fav_station_idx = 0;
-                            }
-                        }
-                    }
-                }
-                else {
-                    // Во всех остальных режимах (PLAY, SET и т.д.) долгое нажатие = MUTE
-                    s_is_muted = !s_is_muted;
-                    s_pending_event = UI_EVENT_MUTE_TOGGLED;
-                }
-                enc_long_press_handled = true; // ✅ Отмечаем, что долгое нажатие обработано
-                ui_needs_redraw = true;
-            }
-        }
-    } else {
-        if (enc_is_pressed) {
-            // Короткое нажатие (отпускание) - только если долгое НЕ было обработано
-            if (!enc_long_press_handled) {
-                if (s_current_mode == MODE_STATIONS) {
-                    s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
-                    s_pending_event = UI_EVENT_STATION_CHANGED;
-                    s_current_mode = MODE_PLAYBACK;
-                }
-                else if (s_current_mode == MODE_FAVORITES) {
-                    int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
-                    if (global_idx >= 0) {
-                        s_new_station_idx = global_idx;
-                        s_pending_event = UI_EVENT_STATION_CHANGED;
-                        s_current_mode = MODE_PLAYBACK;
-                    }
-                }
-                else if (s_current_mode == MODE_CATEGORIES) {
-                    s_current_mode = MODE_STATIONS;
-                    s_ui_station_idx = 0;
-                }
-                else if (s_current_mode == MODE_WIFI) {
-                    if (s_wifi_show_scan_results) {
-                        // Выбор сети из списка сканирования
-                        if (s_wifi_scan_selected_idx >= 0) {
-                            const wifi_scan_record_t* rec = wifi_scan_get_record(s_wifi_scan_selected_idx);
-                            if (rec) {
-                                strncpy(s_wifi_ssid, rec->ssid, sizeof(s_wifi_ssid) - 1);
-                                s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
-                                s_wifi_show_scan_results = false;
-                                s_wifi_focus = 1; // Переводим фокус на пароль
-                                ESP_LOGI(TAG, "Wi-Fi SSID selected from scan: %s", s_wifi_ssid);
-                            }
-                        }
-                    } else {
-                        // Если клавиатура уже активна, повторный клик энкодером ЗАКРЫВАЕТ её
-                        if (s_keyboard_active) {
-                            s_keyboard_active = false;
-                        } else {
-                            // Иначе активируем поле ввода или кнопку
-                            if (s_wifi_focus == 0) {
-                                s_keyboard_active = true;
-                                s_keyboard_target = KB_TARGET_SSID;
-                            } else if (s_wifi_focus == 1) {
-                                s_keyboard_active = true;
-                                s_keyboard_target = KB_TARGET_PASS;
-                            } else if (s_wifi_focus == 2) {
-                                ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
-                                ui_trigger_wifi_scan();
-                            } else if (s_wifi_focus == 3) {
-                                ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
-                                ui_trigger_wifi_connect();
-                            }
-                        }
-                    }
-                    ui_needs_redraw = true;
-                }
-                else if (s_current_mode == MODE_SETTINGS) {
-                    // ✅ Короткий клик в настройках выбирает пункт меню
-                    if (s_settings_idx == 0) {
-                        s_current_mode = MODE_WIFI;
-                    } else if (s_settings_idx == 1) {
-                        s_current_mode = MODE_CATALOG;
-                    } else if (s_settings_idx == 2) {
-                        s_current_mode = MODE_ABOUT;
-                    } else if (s_settings_idx == 3) {
-                        s_current_mode = MODE_PLAYBACK; // Возврат на главный экран
-                    }
-                }
-                else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
-                    // ✅ Короткий клик в About или Catalog возвращает в настройки
-                    s_current_mode = MODE_SETTINGS;
-                }
-            }
             enc_is_pressed = false;
             s_encoder_accumulator = 0;
             ui_needs_redraw = true;
