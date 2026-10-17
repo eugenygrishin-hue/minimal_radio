@@ -28,6 +28,7 @@ static volatile bool g_wifi_test_active = false;
 static volatile bool g_wifi_pending_reconnect = false;
 static volatile bool g_wifi_reconnect_in_progress = false;
 static volatile bool g_wifi_link_seen_down = false;
+static uint64_t g_wifi_reconnect_started_ms = 0;
 
 static bool g_sntp_started = false;
 
@@ -215,20 +216,38 @@ extern "C" void app_main(void) {
         }
 
         // 2. Если идёт reconnect — ждём сначала down, потом up, затем рестартим поток
+        // ========================================================
+        // Wi-Fi reconnect monitor + watchdog
+        // ========================================================
         if (g_wifi_reconnect_in_progress) {
-            if (!wifi_is_connected()) {
+            bool link_up = wifi_is_connected();
+
+            if (!link_up) {
                 g_wifi_link_seen_down = true;
-            }
+            } else if (g_wifi_link_seen_down) {
+                ESP_LOGI(TAG, "Wi-Fi reconnect finished. Restarting stream...");
 
-            if (g_wifi_link_seen_down &&
-                wifi_is_connected() &&
-                !http_stream_is_running() &&
-                !wifi_is_testing() &&
-                !g_wifi_test_active) {
-
-                ESP_LOGI(TAG, "Wi-Fi link restored, restarting stream");
-                http_stream_start(get_station_url_from_catalog(g_selected_station));
                 g_wifi_reconnect_in_progress = false;
+                g_wifi_link_seen_down        = false;
+                g_wifi_pending_reconnect     = false;
+
+                http_stream_restart();
+                ui_set_current_mode(MODE_PLAYBACK);
+            } else {
+                // Watchdog: если reconnect запрошен, но Wi-Fi ни разу не падал —
+                // через 15 секунд принудительно возобновляем поток.
+                uint64_t now_ms = esp_timer_get_time() / 1000;
+
+                if (now_ms - g_wifi_reconnect_started_ms > 15000) {
+                    ESP_LOGW(TAG, "Reconnect watchdog fired. Link stayed up. Resuming stream.");
+
+                    g_wifi_reconnect_in_progress = false;
+                    g_wifi_link_seen_down        = false;
+                    g_wifi_pending_reconnect     = false;
+
+                    http_stream_restart();
+                    ui_set_current_mode(MODE_PLAYBACK);
+                }
             }
         }
 
@@ -281,41 +300,76 @@ extern "C" void app_main(void) {
         }
         else if (event == UI_EVENT_WIFI_SCAN_REQUESTED) {
             ESP_LOGI(TAG, "Pausing stream and starting Wi-Fi scan...");
-            http_stream_request_stop(); // Ставим поток на паузу
 
-            int count = wifi_scan_networks();
-            if (count >= 0) {
-                ui_set_wifi_scan_ready(true); // Показываем список на экране
-                ESP_LOGI(TAG, "Wi-Fi scan found %d networks", count);
-            } else {
-                ESP_LOGE(TAG, "Wi-Fi scan failed");
-                ui_set_wifi_scan_ready(false); // На всякий случай
+            http_stream_request_stop();
+
+            int found = wifi_scan_networks();
+
+            ESP_LOGI(TAG, "Wi-Fi scan found %d networks", found);
+
+            ui_set_wifi_scan_ready(found > 0);
+
+            // Если сетей не нашли — сразу возобновляем поток,
+            // чтобы радио не молчало просто так.
+            if (found <= 0) {
+                ESP_LOGI(TAG, "No Wi-Fi networks found. Resuming stream.");
+                http_stream_restart();
             }
         }
         else if (event == UI_EVENT_WIFI_CONNECT_REQUESTED) {
-            ESP_LOGI(TAG, "Wi-Fi Connect requested. Saving and preparing reconnect...");
+            ESP_LOGI(TAG, "Wi-Fi Connect requested. Saving credentials...");
 
-            // 1. Получаем актуальные данные из UI
-            char new_ssid[33], new_pass[65];
+            char new_ssid[33] = {0};
+            char new_pass[65] = {0};
+
             ui_get_wifi_credentials(new_ssid, sizeof(new_ssid), new_pass, sizeof(new_pass));
 
-            // 2. Сохраняем в NVS и обновляем глобальные переменные
+            bool same_ssid = (strcmp(new_ssid, g_wifi_ssid) == 0);
+            bool same_pass = (strcmp(new_pass, g_wifi_pass) == 0);
+            bool link_up   = wifi_is_connected();
+
+            ESP_LOGI(TAG, "Wi-Fi Connect check: same_ssid=%d same_pass=%d link_up=%d",
+                     (int)same_ssid, (int)same_pass, (int)link_up);
+
+            // 1. Всегда сохраняем креды
             storage_save_wifi(new_ssid, new_pass);
-            strcpy(g_wifi_ssid, new_ssid);
-            strcpy(g_wifi_pass, new_pass);
+
+            strncpy(g_wifi_ssid, new_ssid, sizeof(g_wifi_ssid) - 1);
+            g_wifi_ssid[sizeof(g_wifi_ssid) - 1] = '\0';
+
+            strncpy(g_wifi_pass, new_pass, sizeof(g_wifi_pass) - 1);
+            g_wifi_pass[sizeof(g_wifi_pass) - 1] = '\0';
+
             ui_set_wifi_credentials(g_wifi_ssid, g_wifi_pass);
 
-            // 3. Останавливаем текущий поток (если он был запущен)
+            // 2. Если креды те же и Wi-Fi уже подключён — сразу возобновляем поток.
+            if (same_ssid && same_pass && link_up) {
+                ESP_LOGI(TAG, "Wi-Fi unchanged and link up. Resuming playback immediately.");
+
+                http_stream_restart();
+
+                ui_set_current_mode(MODE_PLAYBACK);
+
+                // ВАЖНО: выходим из обработчика, чтобы не провалиться в reconnect.
+                goto after_wifi_connect;
+            }
+
+            // 3. Креды изменились или link down — полноценный reconnect.
+            ESP_LOGI(TAG, "Wi-Fi changed or link down. Reconnecting...");
+
             http_stream_request_stop();
 
-            // 4. Активируем флаги для главного цикла!
-            // Именно они заставят цикл дождаться подключения Wi-Fi и вызвать http_stream_start()
-            g_wifi_pending_reconnect = true;
-            g_wifi_reconnect_in_progress = true;
-            g_wifi_link_seen_down = false; // Сбрасываем, чтобы цикл зафиксировал переход down -> up
+            wifi_reconnect(g_wifi_ssid, g_wifi_pass);
 
-            // 5. Возвращаемся в меню настроек
+            g_wifi_pending_reconnect    = true;
+            g_wifi_reconnect_in_progress = true;
+            g_wifi_link_seen_down        = false;
+            g_wifi_reconnect_started_ms  = esp_timer_get_time() / 1000;
+
             ui_set_current_mode(MODE_SETTINGS);
+
+        after_wifi_connect:
+            ;
         }
         else if (event == UI_EVENT_VOLUME_CHANGED) {
             audio_set_volume(ui_get_volume());

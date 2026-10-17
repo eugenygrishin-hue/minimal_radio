@@ -27,6 +27,8 @@ static SemaphoreHandle_t s_http_mutex = NULL;
 
 static char s_stream_title[128] = "Connecting...";
 static int s_metaint = 0;
+static char s_http_last_url[256] = {0};
+
 
 // =====================================================================
 // 1. Улучшенный детектор русского UTF-8 (теперь видит ВСЕ русские буквы)
@@ -407,6 +409,12 @@ void http_stream_stop(void) {
 }
 
 void http_stream_start(const char *url) {
+
+	if (url != nullptr) {
+	    strncpy(s_http_last_url, url, sizeof(s_http_last_url) - 1);
+	    s_http_last_url[sizeof(s_http_last_url) - 1] = '\0';
+	}
+
     if (s_http_mutex == NULL) return;
 
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
@@ -440,4 +448,14 @@ uint32_t http_stream_get_ring_fill(void) {
     }
 
     return used;
+}
+
+void http_stream_restart(void) {
+    if (s_http_last_url[0] == '\0') {
+        ESP_LOGW(TAG, "http_stream_restart: no last URL stored");
+        return;
+    }
+
+    ESP_LOGI(TAG, "http_stream_restart: restarting with URL: %s", s_http_last_url);
+    http_stream_start(s_http_last_url);
 }

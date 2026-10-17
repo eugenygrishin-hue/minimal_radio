@@ -1,5 +1,11 @@
 #pragma once
 
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "freertos/ringbuf.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -14,3 +20,8 @@ const char* http_stream_get_title();
 int http_stream_get_metaint();
 
 uint32_t http_stream_get_ring_fill(void);
+void http_stream_restart(void);
+
+#ifdef __cplusplus
+}
+#endif

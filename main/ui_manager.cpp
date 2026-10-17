@@ -552,10 +552,13 @@ static void wifi_back_action(void) {
         s_wifi_show_scan_results = false;
         s_wifi_scan_selected_idx = -1;
         s_wifi_focus = 0;
+        s_keyboard_shift = false;
         ESP_LOGI(TAG, "Scan results closed by back action");
         return;
     }
 
+    s_wifi_focus = 0;
+    s_keyboard_shift = false;
     s_current_mode = MODE_SETTINGS;
     ESP_LOGI(TAG, "Exited Wi-Fi mode to SETTINGS");
 }
@@ -810,19 +813,30 @@ static void draw_ui_impl(T& lcd) {
     const char* modes[] = {"PLAY", "FAV", "CAT", "STA", "SET"};
     int menu_y = 18;
     int menu_h = 22;
-    for (int i = 0; i < 5; i++) { // Теперь всегда 5 вкладок
-        if (i == (int)s_current_mode) {
+
+    int active_tab = (int)s_current_mode;
+
+    // Wi-Fi, About и Catalog — это суб-меню настроек,
+    // поэтому визуально подсвечиваем вкладку SET.
+    if (active_tab == (int)MODE_WIFI ||
+        active_tab == (int)MODE_ABOUT ||
+        active_tab == (int)MODE_CATALOG) {
+        active_tab = (int)MODE_SETTINGS;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        if (i == active_tab) {
             lcd.fillRect(i * 64, menu_y, 64, menu_h, 0x07E0);
             lcd.setTextColor(TFT_BLACK);
         } else {
             lcd.fillRect(i * 64, menu_y, 64, menu_h, TFT_BLACK);
             lcd.setTextColor(TFT_LIGHTGRAY);
         }
+
         lcd.setFont(&fonts::Font0);
         lcd.setTextDatum(MC_DATUM);
         lcd.drawString(modes[i], i * 64 + 32, menu_y + menu_h / 2 + 1);
     }
-
     lcd.setTextDatum(TL_DATUM);
 
     if (s_is_muted) {
@@ -1580,21 +1594,7 @@ void ui_update() {
     // ========================================================
     if (btn_a_edge) {
         if (s_current_mode == MODE_WIFI) {
-            if (s_keyboard_active) {
-                s_keyboard_active = false;
-                s_keyboard_target = KB_TARGET_NONE;
-            }
-            else if (s_wifi_show_scan_results) {
-                s_wifi_show_scan_results = false;
-                s_wifi_scan_selected_idx = -1;
-                s_wifi_focus = 0;
-            }
-            else {
-                s_current_mode = MODE_SETTINGS;
-                s_wifi_focus = 0;
-                s_keyboard_active = false;
-                s_keyboard_target = KB_TARGET_NONE;
-            }
+            wifi_back_action();
         }
         else if (s_current_mode == MODE_PLAYBACK) {
             s_current_mode = MODE_SETTINGS;
@@ -1626,21 +1626,7 @@ void ui_update() {
     // ========================================================
     if (btn_b_edge) {
         if (s_current_mode == MODE_WIFI) {
-            if (s_keyboard_active) {
-                s_keyboard_active = false;
-                s_keyboard_target = KB_TARGET_NONE;
-            }
-            else if (s_wifi_show_scan_results) {
-                s_wifi_show_scan_results = false;
-                s_wifi_scan_selected_idx = -1;
-                s_wifi_focus = 0;
-            }
-            else {
-                s_current_mode = MODE_SETTINGS;
-                s_wifi_focus = 0;
-                s_keyboard_active = false;
-                s_keyboard_target = KB_TARGET_NONE;
-            }
+            wifi_back_action();
         }
         else if (s_current_mode == MODE_PLAYBACK) {
             s_current_mode = MODE_FAVORITES;
@@ -1710,29 +1696,7 @@ void ui_update() {
                     }
                 }
                 else if (s_current_mode == MODE_WIFI) {
-                    if (s_wifi_show_scan_results) {
-                        wifi_select_scan_result(s_wifi_scan_selected_idx);
-                    }
-                    else if (s_keyboard_active) {
-                        // Повторный клик закрывает клавиатуру
-                        wifi_kb_close();
-                    }
-                    else {
-                        if (s_wifi_focus == 0) {
-                            wifi_kb_open(KB_TARGET_SSID);
-                        }
-                        else if (s_wifi_focus == 1) {
-                            wifi_kb_open(KB_TARGET_PASS);
-                        }
-                        else if (s_wifi_focus == 2) {
-                            ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
-                            ui_trigger_wifi_scan();
-                        }
-                        else if (s_wifi_focus == 3) {
-                            ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
-                            ui_trigger_wifi_connect();
-                        }
-                    }
+                    wifi_back_action();
                 }
                 else {
                     // В остальных режимах долгое нажатие = MUTE
@@ -1789,53 +1753,17 @@ void ui_update() {
                 }
                 else if (s_current_mode == MODE_WIFI) {
                     if (s_wifi_show_scan_results) {
-                        int count = wifi_scan_get_count();
-
-                        if (count > 0) {
-                            if (s_wifi_scan_selected_idx < 0) {
-                                s_wifi_scan_selected_idx = 0;
-                            }
-
-                            if (s_wifi_scan_selected_idx >= 0 && s_wifi_scan_selected_idx < count) {
-                                const wifi_scan_record_t* rec = wifi_scan_get_record(s_wifi_scan_selected_idx);
-
-                                if (rec != nullptr) {
-                                    strncpy(s_wifi_ssid, rec->ssid, sizeof(s_wifi_ssid) - 1);
-                                    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
-
-                                    s_wifi_show_scan_results = false;
-                                    s_wifi_scan_selected_idx = -1;
-                                    s_wifi_focus = 1;
-
-                                    // Сразу открываем ввод пароля
-                                    s_keyboard_active = true;
-                                    s_keyboard_target = KB_TARGET_PASS;
-
-                                    ESP_LOGI(TAG, "Wi-Fi SSID selected from scan: %s", s_wifi_ssid);
-                                }
-                            }
-                        } else {
-                            // Нет сетей — переходим в ручной ввод SSID
-                            s_wifi_show_scan_results = false;
-                            s_wifi_scan_selected_idx = -1;
-                            s_wifi_focus = 0;
-                            s_keyboard_active = true;
-                            s_keyboard_target = KB_TARGET_SSID;
-                        }
+                        wifi_select_scan_result(s_wifi_scan_selected_idx);
                     }
                     else if (s_keyboard_active) {
-                        // Повторный клик закрывает клавиатуру
-                        s_keyboard_active = false;
-                        s_keyboard_target = KB_TARGET_NONE;
+                        wifi_kb_close();
                     }
                     else {
                         if (s_wifi_focus == 0) {
-                            s_keyboard_active = true;
-                            s_keyboard_target = KB_TARGET_SSID;
+                            wifi_kb_open(KB_TARGET_SSID);
                         }
                         else if (s_wifi_focus == 1) {
-                            s_keyboard_active = true;
-                            s_keyboard_target = KB_TARGET_PASS;
+                            wifi_kb_open(KB_TARGET_PASS);
                         }
                         else if (s_wifi_focus == 2) {
                             ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
