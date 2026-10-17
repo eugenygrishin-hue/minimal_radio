@@ -24,14 +24,37 @@ static const int KB_KEY_H = 26;
 static const int KB_GAP = 2;
 static const int KB_SPECIAL_W = 100;
 
-// ============================================================
-// Константы кнопок Wi-Fi
-// ============================================================
-static const int WIFI_BTN_W = 145;
-static const int WIFI_BTN_H = 35;
+// Координаты для экрана 320x240
+
+static const int WIFI_BTN_X   = 5;
+static const int WIFI_BTN_Y   = 112;
+static const int WIFI_BTN_W   = 150;
+static const int WIFI_BTN_H   = 26;
 static const int WIFI_BTN_GAP = 10;
-static const int WIFI_BTN_X = 12;
-static const int WIFI_BTN_Y = 150;
+
+static const int WIFI_FIELD_Y[2] = {58, 84};
+static const int WIFI_FIELD_H = 24;
+
+static const int WIFI_KB_Y = 110;
+static const int WIFI_KB_H = 24;
+static const int WIFI_KB_X = 5;
+static const int WIFI_KB_W = 30;
+static const int WIFI_KB_STEP = 31;
+static const int WIFI_KB_ROWS = 5;
+
+static const char* WIFI_KB_LETTER_ROWS[4] = {
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm,.",
+    "1234567890"
+};
+
+static const int WIFI_KB_ACTION_X[4] = {5, 71, 171, 237};
+static const int WIFI_KB_ACTION_W[4] = {62, 96, 62, 62};
+static const char* WIFI_KB_ACTION_LABEL[4] = {"Shift", "Space", "Del", "OK"};
+
+static const int WIFI_BTN2_X   = WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP;
+static const int WIFI_BTN_ROW2_Y = WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP;
 
 // ============================================================
 // Энкодер: анти-дребезг через накопитель
@@ -451,6 +474,329 @@ static void draw_net_sparkline_impl(T& lcd, int x, int y, int w, int h) {
 }
 
 // ============================================================
+// Wi-Fi manual input / on-screen keyboard helpers
+// ============================================================
+
+static bool s_keyboard_shift = false;
+
+static int wifi_scan_view_start(void) {
+    int start = s_wifi_scan_selected_idx;
+
+    if (start > 2) {
+        start = s_wifi_scan_selected_idx - 2;
+    }
+
+    if (start < 0) {
+        start = 0;
+    }
+
+    return start;
+}
+
+static void wifi_kb_append_char(char c) {
+    char* buf = (s_keyboard_target == KB_TARGET_PASS) ? s_wifi_pass : s_wifi_ssid;
+
+    size_t max_len = (s_keyboard_target == KB_TARGET_PASS)
+                         ? (sizeof(s_wifi_pass) - 1)
+                         : (sizeof(s_wifi_ssid) - 1);
+
+    size_t len = strlen(buf);
+
+    if (len < max_len) {
+        buf[len] = c;
+        buf[len + 1] = '\0';
+    }
+}
+
+static void wifi_kb_backspace(void) {
+    char* buf = (s_keyboard_target == KB_TARGET_PASS) ? s_wifi_pass : s_wifi_ssid;
+    size_t len = strlen(buf);
+
+    if (len > 0) {
+        buf[len - 1] = '\0';
+    }
+}
+
+static void wifi_kb_close(void) {
+    s_keyboard_active = false;
+    s_keyboard_target = KB_TARGET_NONE;
+    s_keyboard_shift = false;
+}
+
+static void wifi_kb_open(kb_target_t target) {
+    s_keyboard_active = true;
+    s_keyboard_target = target;
+    s_keyboard_shift = false;
+
+    // Если был открыт список скана — закрываем его
+    s_wifi_show_scan_results = false;
+    s_wifi_scan_selected_idx = -1;
+
+    if (target == KB_TARGET_SSID) {
+        s_wifi_focus = 0;
+    } else {
+        s_wifi_focus = 1;
+    }
+
+    ESP_LOGI(TAG, "Keyboard opened for target=%d", (int)target);
+}
+
+static void wifi_back_action(void) {
+    if (s_keyboard_active) {
+        wifi_kb_close();
+        ESP_LOGI(TAG, "Keyboard closed by back action");
+        return;
+    }
+
+    if (s_wifi_show_scan_results) {
+        s_wifi_show_scan_results = false;
+        s_wifi_scan_selected_idx = -1;
+        s_wifi_focus = 0;
+        ESP_LOGI(TAG, "Scan results closed by back action");
+        return;
+    }
+
+    s_current_mode = MODE_SETTINGS;
+    ESP_LOGI(TAG, "Exited Wi-Fi mode to SETTINGS");
+}
+
+static void wifi_select_scan_result(int idx) {
+    int count = wifi_scan_get_count();
+
+    if (count == 0) {
+        s_wifi_show_scan_results = false;
+        s_wifi_scan_selected_idx = -1;
+        wifi_kb_open(KB_TARGET_SSID);
+        return;
+    }
+
+    if (idx < 0 || idx >= count) {
+        idx = 0;
+    }
+
+    const wifi_scan_record_t* rec = wifi_scan_get_record(idx);
+
+    if (rec != nullptr) {
+        strncpy(s_wifi_ssid, rec->ssid, sizeof(s_wifi_ssid) - 1);
+        s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+
+        ESP_LOGI(TAG, "Wi-Fi SSID selected from scan: %s", s_wifi_ssid);
+    }
+
+    s_wifi_show_scan_results = false;
+    s_wifi_scan_selected_idx = -1;
+
+    // Сразу открываем ввод пароля
+    wifi_kb_open(KB_TARGET_PASS);
+}
+
+static void handle_wifi_touch(int32_t x, int32_t y) {
+    ESP_LOGI(TAG, "handle_wifi_touch x=%d y=%d scan=%d kb=%d focus=%d",
+             (int)x, (int)y,
+             (int)s_wifi_show_scan_results,
+             (int)s_keyboard_active,
+             s_wifi_focus);
+
+    // ------------------------------------------------------------
+    // 1. Если показан список найденных сетей — работаем только с ним
+    // ------------------------------------------------------------
+    if (s_wifi_show_scan_results) {
+        int count = wifi_scan_get_count();
+
+        if (count == 0) {
+            // Нет сетей — тап по нижней области открывает ручной ввод SSID
+            if (y >= 76) {
+                s_wifi_show_scan_results = false;
+                s_wifi_scan_selected_idx = -1;
+                wifi_kb_open(KB_TARGET_SSID);
+            }
+            return;
+        }
+
+        const int list_y = 76;
+        const int item_h = 26;
+        const int visible = 5;
+
+        int start = wifi_scan_view_start();
+
+        if (y >= list_y && y < list_y + visible * item_h) {
+            int idx = start + (y - list_y) / item_h;
+
+            if (idx >= 0 && idx < count) {
+                wifi_select_scan_result(idx);
+            }
+        }
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 2. Тап по полям SSID / Password
+    //    Работает и когда клавиатура открыта, и когда закрыта.
+    // ------------------------------------------------------------
+    for (int i = 0; i < 2; i++) {
+        int fy = WIFI_FIELD_Y[i] - 2;
+
+        if (x >= 5 && x < 315 && y >= fy && y < fy + WIFI_FIELD_H + 4) {
+            wifi_kb_open(i == 0 ? KB_TARGET_SSID : KB_TARGET_PASS);
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 3. Если клавиатура открыта — обрабатываем тапы по клавиатуре
+    // ------------------------------------------------------------
+    if (s_keyboard_active) {
+        if (y >= WIFI_KB_Y && y < WIFI_KB_Y + WIFI_KB_ROWS * WIFI_KB_H) {
+            int row = (y - WIFI_KB_Y) / WIFI_KB_H;
+
+            // Буквенные/цифровые ряды
+            if (row >= 0 && row < 4) {
+                if (x >= WIFI_KB_X && x < WIFI_KB_X + 10 * WIFI_KB_STEP) {
+                    int col = (x - WIFI_KB_X) / WIFI_KB_STEP;
+
+                    const char* row_str = WIFI_KB_LETTER_ROWS[row];
+                    int len = (int)strlen(row_str);
+
+                    if (col >= 0 && col < len) {
+                        char c = row_str[col];
+
+                        if (s_keyboard_shift && c >= 'a' && c <= 'z') {
+                            c = (char)(c - 'a' + 'A');
+                        }
+
+                        wifi_kb_append_char(c);
+
+                        // После ввода символа Shift автоматически выключается
+                        s_keyboard_shift = false;
+
+                        ESP_LOGI(TAG, "Keyboard char: '%c' target=%d",
+                                 c, (int)s_keyboard_target);
+                    }
+                }
+
+                return;
+            }
+
+            // Нижний ряд действий: Shift / Space / Del / OK
+            if (row == 4) {
+                int ay = WIFI_KB_Y + 4 * WIFI_KB_H;
+
+                if (y >= ay && y < ay + WIFI_KB_H - 2) {
+                    for (int i = 0; i < 4; i++) {
+                        int ax = WIFI_KB_ACTION_X[i];
+                        int aw = WIFI_KB_ACTION_W[i];
+
+                        if (x >= ax && x < ax + aw) {
+                            switch (i) {
+                                case 0: // Shift
+                                    s_keyboard_shift = !s_keyboard_shift;
+                                    ESP_LOGI(TAG, "Keyboard shift=%d", (int)s_keyboard_shift);
+                                    break;
+
+                                case 1: // Space
+                                    wifi_kb_append_char(' ');
+                                    ESP_LOGI(TAG, "Keyboard space");
+                                    break;
+
+                                case 2: // Del
+                                    wifi_kb_backspace();
+                                    ESP_LOGI(TAG, "Keyboard backspace");
+                                    break;
+
+                                case 3: // OK
+                                    wifi_kb_close();
+                                    ESP_LOGI(TAG, "Keyboard OK/close");
+                                    break;
+                            }
+
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 4. Если клавиатура закрыта — тапы по кнопкам Scan / Connect
+    // ------------------------------------------------------------
+    int by = WIFI_BTN_Y - 2;
+
+    if (y >= by && y < by + WIFI_BTN_H + 4) {
+        if (x >= 5 && x < 155) {
+            ESP_LOGI(TAG, "Touch Scan pressed");
+            ui_trigger_wifi_scan();
+            return;
+        }
+
+        if (x >= 165 && x < 315) {
+            ESP_LOGI(TAG, "Touch Connect pressed");
+            ui_trigger_wifi_connect();
+            return;
+        }
+    }
+}
+template <typename T>
+static void draw_wifi_keyboard_impl(T& lcd) {
+    lcd.setFont(&fonts::Font0);
+
+    // Буквенные и цифровые ряды
+    for (int row = 0; row < 4; row++) {
+        const char* row_str = WIFI_KB_LETTER_ROWS[row];
+        int len = (int)strlen(row_str);
+        int y = WIFI_KB_Y + row * WIFI_KB_H;
+
+        for (int col = 0; col < 10; col++) {
+            if (col >= len) {
+                continue;
+            }
+
+            char ch = row_str[col];
+
+            if (s_keyboard_shift && ch >= 'a' && ch <= 'z') {
+                ch = (char)(ch - 'a' + 'A');
+            }
+
+            int x = WIFI_KB_X + col * WIFI_KB_STEP;
+
+            lcd.fillRoundRect(x, y, WIFI_KB_W, WIFI_KB_H - 2, 3, TFT_BLACK);
+            lcd.drawRoundRect(x, y, WIFI_KB_W, WIFI_KB_H - 2, 3, 0x07E0);
+
+            char buf[2] = {ch, '\0'};
+
+            lcd.setTextColor(TFT_WHITE);
+            lcd.setTextDatum(MC_DATUM);
+            lcd.drawString(buf, x + WIFI_KB_W / 2, y + (WIFI_KB_H - 2) / 2);
+        }
+    }
+
+    // Нижний ряд: Shift / Space / Del / OK
+    int ay = WIFI_KB_Y + 4 * WIFI_KB_H;
+
+    for (int i = 0; i < 4; i++) {
+        bool active = (i == 0 && s_keyboard_shift);
+
+        uint16_t bg = active ? 0x07E0 : TFT_BLACK;
+        uint16_t fg = active ? TFT_BLACK : 0x07E0;
+
+        int x = WIFI_KB_ACTION_X[i];
+        int w = WIFI_KB_ACTION_W[i];
+
+        lcd.fillRoundRect(x, ay, w, WIFI_KB_H - 2, 3, bg);
+        lcd.drawRoundRect(x, ay, w, WIFI_KB_H - 2, 3, 0x07E0);
+
+        lcd.setTextColor(fg);
+        lcd.setTextDatum(MC_DATUM);
+        lcd.drawString(WIFI_KB_ACTION_LABEL[i], x + w / 2, ay + (WIFI_KB_H - 2) / 2);
+    }
+
+    lcd.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
 // Отрисовка UI (template)
 // ============================================================
 template <typename T>
@@ -496,92 +842,192 @@ static void draw_ui_impl(T& lcd) {
     if (s_current_mode == MODE_WIFI) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
-        lcd.drawString("Настройка Wi-Fi", 10, 48);
 
         if (s_wifi_show_scan_results) {
-            // --- РЕЖИМ ОТОБРАЖЕНИЯ РЕЗУЛЬТАТОВ СКАНИРОВАНИЯ ---
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString("Выберите сеть:", 10, 68);
-            int count = wifi_scan_get_count();
-            int start_idx = s_wifi_scan_selected_idx;
-            if (start_idx > 3) start_idx = s_wifi_scan_selected_idx - 3;
-
-            int y = 88;
-            for (int i = start_idx; i < count && i < start_idx + 4; i++) {
-                const wifi_scan_record_t* rec = wifi_scan_get_record(i);
-                if (!rec) continue;
-
-                if (i == s_wifi_scan_selected_idx) {
-                    lcd.setTextColor(TFT_BLACK);
-                    lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
-                } else {
-                    lcd.setTextColor(TFT_WHITE);
-                }
-
-                char line_buf[64];
-                // Формируем строку: "SSID (RSSI)"
-                snprintf(line_buf, sizeof(line_buf), "%s (%d)", rec->ssid, rec->rssi);
-                lcd.drawString(line_buf, 15, y);
-                y += 28;
-            }
-            lcd.setTextColor(TFT_LIGHTGRAY);
-            lcd.drawString("Нажми для выбора или A для отмены", 10, 210);
+            lcd.drawString("Найденные сети", 10, 42);
+        } else if (s_keyboard_active) {
+            lcd.drawString("Ввод Wi-Fi", 10, 42);
+        } else {
+            lcd.drawString("Настройка Wi-Fi", 10, 42);
         }
+
+        // ----------------------------------------------------
+        // Режим списка найденных сетей
+        // ----------------------------------------------------
+        if (s_wifi_show_scan_results) {
+            lcd.setFont(&fonts::efontCN_14);
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.drawString("Тап/энкодер - выбрать, A - назад", 10, 58);
+
+            int count = wifi_scan_get_count();
+
+            if (count == 0) {
+                lcd.setTextColor(TFT_YELLOW);
+                lcd.drawString("Сети не найдены", 15, 90);
+                lcd.drawString("Тапни или нажми A и введи SSID вручную", 15, 112);
+            } else {
+                const int list_y = 76;
+                const int item_h = 26;
+                const int visible = 5;
+
+                int start = wifi_scan_view_start();
+                int y = list_y;
+
+                for (int i = start; i < count && i < start + visible; i++) {
+                    const wifi_scan_record_t* rec = wifi_scan_get_record(i);
+
+                    if (rec == nullptr) {
+                        continue;
+                    }
+
+                    bool selected = (i == s_wifi_scan_selected_idx);
+
+                    if (selected) {
+                        lcd.setTextColor(TFT_BLACK);
+                        lcd.fillRoundRect(5, y, 310, item_h - 2, 4, 0x07E0);
+                    } else {
+                        lcd.setTextColor(TFT_WHITE);
+                        lcd.fillRoundRect(5, y, 310, item_h - 2, 4, TFT_BLACK);
+                        lcd.drawRoundRect(5, y, 310, item_h - 2, 4, 0x07E0);
+                    }
+
+                    char line[64];
+                    snprintf(line, sizeof(line), "%s (%d)", rec->ssid, (int)rec->rssi);
+
+                    lcd.setFont(&fonts::efontCN_14);
+                    lcd.drawString(line, 12, y + 4);
+
+                    y += item_h;
+                }
+            }
+        }
+
+        // ----------------------------------------------------
+        // Обычный режим: поля ввода + кнопки / клавиатура
+        // ----------------------------------------------------
         else {
-            // --- ОБЫЧНЫЙ РЕЖИМ ВВОДА ---
-            int y = 68;
-            const char* labels[] = {"SSID:", "Password:"};
-            const char* values[] = {s_wifi_ssid, s_wifi_pass};
+            const char* labels[2] = {"SSID:", "Пароль:"};
+            const char* values[2] = {s_wifi_ssid, s_wifi_pass};
 
             for (int i = 0; i < 2; i++) {
-                bool is_focused = (s_wifi_focus == i);
-                lcd.setFont(&fonts::efontCN_14);
-                if (is_focused) {
+                bool focused;
+
+                if (s_keyboard_active) {
+                    focused = (s_keyboard_target == (i == 0 ? KB_TARGET_SSID : KB_TARGET_PASS));
+                } else {
+                    focused = (s_wifi_focus == i);
+                }
+
+                int fy = WIFI_FIELD_Y[i] - 2;
+
+                if (focused) {
                     lcd.setTextColor(TFT_BLACK);
-                    lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                    lcd.fillRoundRect(5, fy, 310, WIFI_FIELD_H, 4, 0x07E0);
                 } else {
                     lcd.setTextColor(TFT_WHITE);
+                    lcd.fillRoundRect(5, fy, 310, WIFI_FIELD_H, 4, TFT_BLACK);
+                    lcd.drawRoundRect(5, fy, 310, WIFI_FIELD_H, 4, TFT_LIGHTGRAY);
                 }
 
-                char line_buf[64];
-                if (i == 1) { // Маскируем пароль
-                    snprintf(line_buf, sizeof(line_buf), "%s %s", labels[i], "********");
+                // Увеличиваем буферы, чтобы открытый пароль не обрезался слишком рано.
+                char disp[72];
+                disp[0] = '\0';
+
+                // Для SSID всегда показываем как есть.
+                // Для пароля:
+                // - если поле пароля в фокусе -> показываем открытым;
+                // - если не в фокусе -> маскируем звёздочками.
+                if (i == 1 && !focused) {
+                    int n = (int)strlen(values[i]);
+
+                    if (n > 30) {
+                        n = 30;
+                    }
+
+                    for (int k = 0; k < n; k++) {
+                        disp[k] = '*';
+                    }
+
+                    disp[n] = '\0';
                 } else {
-                    snprintf(line_buf, sizeof(line_buf), "%s %s", labels[i], values[i]);
+                    strncpy(disp, values[i], sizeof(disp) - 1);
+                    disp[sizeof(disp) - 1] = '\0';
                 }
-                lcd.drawString(line_buf, 15, y);
-                y += 32;
-            }
 
-            // Кнопки
-            // Кнопки Scan и Connect
-            y = 140;
-            const char* btn_labels[] = {"Scan", "Connect"}; // Сделали надписи короче, чтобы точно влезли
-            for (int i = 0; i < 2; i++) {
-                int focus_idx = i + 2; // 2 и 3
-                bool is_focused = (s_wifi_focus == focus_idx);
+                char line[96];
+                snprintf(line, sizeof(line), "%s %s", labels[i], disp);
+
                 lcd.setFont(&fonts::efontCN_14);
+                lcd.setTextColor(focused ? TFT_BLACK : TFT_WHITE);
+                lcd.drawString(line, 10, WIFI_FIELD_Y[i] + 2);
 
-                int btn_x = (i == 0) ? 5 : 165;
+                // --------------------------------------------------------
+                // Мигающий курсор: показываем только когда клавиатура активна
+                // и активна именно для этого поля.
+                // --------------------------------------------------------
+                bool cursor_here = false;
 
-                if (is_focused) {
-                    lcd.setTextColor(TFT_BLACK);
-                    lcd.fillRoundRect(btn_x, y - 5, 150, 26, 4, 0x07E0); // Зеленая заливка при фокусе
-                } else {
-                    lcd.setTextColor(0x07E0); // Зеленый текст
-                    lcd.fillRoundRect(btn_x, y - 5, 150, 26, 4, TFT_BLACK); // ⚠️ ЯВНАЯ ОЧИСТКА ФОНА ЧЕРНЫМ
-                    lcd.drawRoundRect(btn_x, y - 5, 150, 26, 4, 0x07E0);    // Зеленая рамка
+                if (s_keyboard_active) {
+                    if (i == 0 && s_keyboard_target == KB_TARGET_SSID) {
+                        cursor_here = true;
+                    }
+
+                    if (i == 1 && s_keyboard_target == KB_TARGET_PASS) {
+                        cursor_here = true;
+                    }
                 }
 
-                // Центрируем текст внутри кнопки
-                lcd.setTextDatum(MC_DATUM);
-                lcd.drawString(btn_labels[i], btn_x + 75, y + 8);
-                lcd.setTextDatum(TL_DATUM); // Возвращаем выравнивание по умолчанию
+                if (cursor_here && s_cursor_blink) {
+                    // Ширина текущей строки текста.
+                    // Если вдруг getUTF8width не скомпилируется, замени на:
+                    // int text_w = lcd.getTextWidth(line);
+                	int text_w = lcd.textWidth(line);
+
+                    int cursor_x = 10 + text_w + 2;
+
+                    // Не выпускаем курсор за правый край поля.
+                    if (cursor_x > 306) {
+                        cursor_x = 306;
+                    }
+
+                    int cursor_y = WIFI_FIELD_Y[i] + 3;
+                    int cursor_h = WIFI_FIELD_H - 8;
+
+                    // На зелёном фоне курсор чёрный, на чёрном — белый.
+                    uint16_t cursor_color = focused ? TFT_BLACK : TFT_WHITE;
+
+                    lcd.fillRect(cursor_x, cursor_y, 2, cursor_h, cursor_color);
+                }
             }
 
-            if (s_keyboard_active) {
-                // Здесь должен быть твой существующий код отрисовки клавиатуры
-                // draw_keyboard_impl(lcd);
+            // Кнопки Scan / Connect рисуем только если клавиатура закрыта
+            if (!s_keyboard_active) {
+                const char* btn_labels[2] = {"Scan", "Connect"};
+                const int btn_x[2] = {5, 165};
+
+                for (int i = 0; i < 2; i++) {
+                    int focus_idx = i + 2; // 2=Scan, 3=Connect
+                    bool focused = (s_wifi_focus == focus_idx);
+
+                    int bx = btn_x[i];
+                    int by = WIFI_BTN_Y - 2;
+
+                    if (focused) {
+                        lcd.setTextColor(TFT_BLACK);
+                        lcd.fillRoundRect(bx, by, 150, WIFI_BTN_H, 4, 0x07E0);
+                    } else {
+                        lcd.setTextColor(0x07E0);
+                        lcd.fillRoundRect(bx, by, 150, WIFI_BTN_H, 4, TFT_BLACK);
+                        lcd.drawRoundRect(bx, by, 150, WIFI_BTN_H, 4, 0x07E0);
+                    }
+
+                    lcd.setFont(&fonts::efontCN_14);
+                    lcd.setTextDatum(MC_DATUM);
+                    lcd.drawString(btn_labels[i], bx + 75, WIFI_BTN_Y + 10);
+                    lcd.setTextDatum(TL_DATUM);
+                }
+            } else {
+                draw_wifi_keyboard_impl(lcd);
             }
         }
     }
@@ -886,191 +1332,6 @@ static void draw_ui() {
 }
 
 // ============================================================
-// Обработка тача для Wi-Fi
-// ============================================================
-static void handle_wifi_touch(int x, int y) {
-    // ==========================
-    // Клавиатура активна
-    // ==========================
-    if (s_keyboard_active) {
-        // Тап по статус-бару или меню — прячем клавиатуру
-        if (y < 42) {
-            s_keyboard_active = false;
-            return;
-        }
-
-        // Тап по полю SSID — переключаем фокус
-        if (y >= 42 && y <= 66) {
-            s_editing_ssid = true;
-            strcpy(s_input_buffer, s_wifi_ssid);
-            s_shift_active = false;
-            return;
-        }
-
-        // Тап по полю PASS — переключаем фокус
-        if (y >= 72 && y <= 96) {
-            s_editing_ssid = false;
-            strcpy(s_input_buffer, s_wifi_pass);
-            s_shift_active = false;
-            return;
-        }
-
-        // Тап в промежутке между полями и клавиатурой — прячем клавиатуру
-        if (y < KB_START_Y) {
-            s_keyboard_active = false;
-            return;
-        }
-
-        // Проверяем обычные клавиши
-        for (int row = 0; row < 4; row++) {
-            for (int col = 0; col < 10; col++) {
-                int kx = KB_START_X + col * (KB_KEY_W + KB_GAP);
-                int ky = KB_START_Y + row * (KB_KEY_H + KB_GAP);
-
-                if (x >= kx && x <= kx + KB_KEY_W && y >= ky && y <= ky + KB_KEY_H) {
-                    char c = kb_rows[row][col];
-                    if (!s_shift_active && c >= 'A' && c <= 'Z') c = c + 32;
-
-                    int len = strlen(s_input_buffer);
-                    if (len < 64) {
-                        s_input_buffer[len] = c;
-                        s_input_buffer[len + 1] = '\0';
-
-                        if (s_editing_ssid) {
-                            strcpy(s_wifi_ssid, s_input_buffer);
-                        } else {
-                            strcpy(s_wifi_pass, s_input_buffer);
-                        }
-
-                        s_has_unsaved_changes = true;
-                    }
-
-                    s_shift_active = false;
-                    return;
-                }
-            }
-        }
-
-        // Нижняя служебная строка
-        int y5 = KB_START_Y + 4 * (KB_KEY_H + KB_GAP);
-
-        // Shift
-        if (x >= KB_START_X && x <= KB_START_X + KB_SPECIAL_W &&
-            y >= y5 && y <= y5 + KB_KEY_H) {
-            s_shift_active = !s_shift_active;
-            return;
-        }
-
-        // Space
-        if (x >= KB_START_X + KB_SPECIAL_W + KB_GAP &&
-            x <= KB_START_X + 2 * KB_SPECIAL_W + KB_GAP &&
-            y >= y5 && y <= y5 + KB_KEY_H) {
-            int len = strlen(s_input_buffer);
-            if (len < 64) {
-                s_input_buffer[len] = ' ';
-                s_input_buffer[len + 1] = '\0';
-
-                if (s_editing_ssid) {
-                    strcpy(s_wifi_ssid, s_input_buffer);
-                } else {
-                    strcpy(s_wifi_pass, s_input_buffer);
-                }
-
-                s_has_unsaved_changes = true;
-            }
-            return;
-        }
-
-        // Backspace
-        if (x >= KB_START_X + 2 * (KB_SPECIAL_W + KB_GAP) &&
-            x <= KB_START_X + 3 * KB_SPECIAL_W + 2 * KB_GAP &&
-            y >= y5 && y <= y5 + KB_KEY_H) {
-            int len = strlen(s_input_buffer);
-            if (len > 0) {
-                s_input_buffer[len - 1] = '\0';
-
-                if (s_editing_ssid) {
-                    strcpy(s_wifi_ssid, s_input_buffer);
-                } else {
-                    strcpy(s_wifi_pass, s_input_buffer);
-                }
-
-                s_has_unsaved_changes = true;
-            }
-            return;
-        }
-
-        // Любой другой тап — прячем клавиатуру
-        s_keyboard_active = false;
-        return;
-    }
-
-    // ==========================
-    // Клавиатура не активна
-    // ==========================
-
-    // Тап по полю SSID
-    if (y >= 42 && y <= 66) {
-        s_editing_ssid = true;
-        s_keyboard_active = true;
-        strcpy(s_input_buffer, s_wifi_ssid);
-        s_shift_active = false;
-        return;
-    }
-
-    // Тап по полю PASS
-    if (y >= 72 && y <= 96) {
-        s_editing_ssid = false;
-        s_keyboard_active = true;
-        strcpy(s_input_buffer, s_wifi_pass);
-        s_shift_active = false;
-        return;
-    }
-
-    // Если тест Wi-Fi уже выполняется — игнорируем кнопки
-    if (s_wifi_test_result == WIFI_TEST_IN_PROGRESS) {
-        ESP_LOGW(TAG, "Wi-Fi test in progress, ignoring action buttons");
-        return;
-    }
-
-    // Revert
-    if (x >= WIFI_BTN_X && x <= WIFI_BTN_X + WIFI_BTN_W &&
-        y >= WIFI_BTN_Y && y <= WIFI_BTN_Y + WIFI_BTN_H) {
-        strcpy(s_wifi_ssid, s_wifi_ssid_original);
-        strcpy(s_wifi_pass, s_wifi_pass_original);
-        s_has_unsaved_changes = false;
-        s_pending_event = UI_EVENT_WIFI_REVERT;
-        return;
-    }
-
-    // Save
-    if (x >= WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP &&
-        x <= WIFI_BTN_X + 2 * WIFI_BTN_W + WIFI_BTN_GAP &&
-        y >= WIFI_BTN_Y && y <= WIFI_BTN_Y + WIFI_BTN_H) {
-        s_pending_event = UI_EVENT_WIFI_SAVE;
-        return;
-    }
-
-    // Test
-    if (x >= WIFI_BTN_X && x <= WIFI_BTN_X + WIFI_BTN_W &&
-        y >= WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP &&
-        y <= WIFI_BTN_Y + 2 * WIFI_BTN_H + WIFI_BTN_GAP) {
-        s_pending_event = UI_EVENT_WIFI_TEST;
-        s_wifi_test_result = WIFI_TEST_IN_PROGRESS;
-        return;
-    }
-
-    // Connect
-    if (x >= WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP &&
-        x <= WIFI_BTN_X + 2 * WIFI_BTN_W + WIFI_BTN_GAP &&
-        y >= WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP &&
-        y <= WIFI_BTN_Y + 2 * WIFI_BTN_H + WIFI_BTN_GAP) {
-        s_pending_event = UI_EVENT_WIFI_CONNECT;
-        return;
-    }
-}
-
-// ============================================================
 // Публичные функции
 // ============================================================
 void ui_init() {
@@ -1126,6 +1387,11 @@ void ui_update() {
     // ========================================================
     auto touch          = M5.Touch.getDetail();
     bool touch_pressed  = touch.wasPressed();
+
+    if (touch_pressed) {
+        ESP_LOGI(TAG, "Touch raw: x=%d y=%d mode=%d",
+                 (int)touch.x, (int)touch.y, (int)s_current_mode);
+    }
 
     int32_t increment   = read_hmi_register_32(0x10);
     bool btn_a          = read_hmi_register_8(0x21);
@@ -1190,6 +1456,13 @@ void ui_update() {
     // 4. Обработка тача в режиме Wi-Fi
     // ========================================================
     if (s_current_mode == MODE_WIFI && touch_pressed) {
+        ESP_LOGI(TAG, "WiFi touch: x=%d y=%d kb=%d scan=%d focus=%d",
+                 (int)touch.x,
+                 (int)touch.y,
+                 (int)s_keyboard_active,
+                 (int)s_wifi_show_scan_results,
+                 s_wifi_focus);
+
         handle_wifi_touch(touch.x, touch.y);
         ui_needs_redraw = true;
     }
@@ -1437,21 +1710,28 @@ void ui_update() {
                     }
                 }
                 else if (s_current_mode == MODE_WIFI) {
-                    // Долгое нажатие в Wi-Fi = безопасный выход/отмена
-                    if (s_keyboard_active) {
-                        s_keyboard_active = false;
-                        s_keyboard_target = KB_TARGET_NONE;
+                    if (s_wifi_show_scan_results) {
+                        wifi_select_scan_result(s_wifi_scan_selected_idx);
                     }
-                    else if (s_wifi_show_scan_results) {
-                        s_wifi_show_scan_results = false;
-                        s_wifi_scan_selected_idx = -1;
-                        s_wifi_focus = 0;
+                    else if (s_keyboard_active) {
+                        // Повторный клик закрывает клавиатуру
+                        wifi_kb_close();
                     }
                     else {
-                        s_current_mode = MODE_SETTINGS;
-                        s_wifi_focus = 0;
-                        s_keyboard_active = false;
-                        s_keyboard_target = KB_TARGET_NONE;
+                        if (s_wifi_focus == 0) {
+                            wifi_kb_open(KB_TARGET_SSID);
+                        }
+                        else if (s_wifi_focus == 1) {
+                            wifi_kb_open(KB_TARGET_PASS);
+                        }
+                        else if (s_wifi_focus == 2) {
+                            ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
+                            ui_trigger_wifi_scan();
+                        }
+                        else if (s_wifi_focus == 3) {
+                            ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
+                            ui_trigger_wifi_connect();
+                        }
                     }
                 }
                 else {
