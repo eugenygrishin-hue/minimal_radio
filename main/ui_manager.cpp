@@ -6,23 +6,19 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "esp_app_desc.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+
 #include <M5Unified.hpp>
 #include <cstring>
 #include <cstdio>
 #include <ctime>
 #include <new>
 
-static const char* TAG = "UI";
 
-// ============================================================
-// Константы клавиатуры
-// ============================================================
-static const int KB_START_X = 10;
-static const int KB_START_Y = 98;
-static const int KB_KEY_W = 30;
-static const int KB_KEY_H = 26;
-static const int KB_GAP = 2;
-static const int KB_SPECIAL_W = 100;
+static const char* TAG = "UI";
 
 // Координаты для экрана 320x240
 
@@ -53,8 +49,6 @@ static const int WIFI_KB_ACTION_X[4] = {5, 71, 171, 237};
 static const int WIFI_KB_ACTION_W[4] = {62, 96, 62, 62};
 static const char* WIFI_KB_ACTION_LABEL[4] = {"Shift", "Space", "Del", "OK"};
 
-static const int WIFI_BTN2_X   = WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP;
-static const int WIFI_BTN_ROW2_Y = WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP;
 
 // ============================================================
 // Энкодер: анти-дребезг через накопитель
@@ -82,15 +76,9 @@ static bool enc_long_press_handled = false;
 // Wi-Fi настройки
 static char s_wifi_ssid[33] = DEFAULT_WIFI_SSID;
 static char s_wifi_pass[65] = DEFAULT_WIFI_PASS;
-static char s_wifi_ssid_original[33] = DEFAULT_WIFI_SSID;
-static char s_wifi_pass_original[65] = DEFAULT_WIFI_PASS;
 static bool s_keyboard_active = false;
-static bool s_editing_ssid = true;
-static bool s_shift_active = false;
-static char s_input_buffer[65] = {0};
 static bool s_cursor_blink = false;
 static uint32_t s_cursor_blink_counter = 0;
-static bool s_has_unsaved_changes = false;
 static wifi_test_result_t s_wifi_test_result = WIFI_TEST_NOT_STARTED;
 
 static int s_wifi_focus = 0; // 0=SSID поле, 1=PASS поле, 2=Кнопка Scan, 3=Кнопка Connect
@@ -123,14 +111,6 @@ static int s_new_volume = 0;
 
 static ui_mode_t s_current_mode = MODE_PLAYBACK;
 
-// Клавиатура
-static const char* kb_rows[4] = {
-    "1234567890",
-    "QWERTYUIOP",
-    "ASDFGHJKL_",
-    "ZXCVBNM-."
-};
-
 typedef enum {
     KB_TARGET_NONE = 0,
     KB_TARGET_SSID,
@@ -161,146 +141,6 @@ static bool read_hmi_register_8(uint8_t reg) {
     uint8_t val = 0;
     if (!M5.In_I2C.readRegister(HMI_I2C_ADDR, reg, &val, 1, 100000)) return false;
     return val == 0;
-}
-
-// ============================================================
-// Отрисовка клавиатуры (template)
-// ============================================================
-template <typename T>
-static void draw_keyboard_impl(T& lcd) {
-    lcd.setFont(&fonts::Font2);
-
-    for (int row = 0; row < 4; row++) {
-        for (int col = 0; col < 10; col++) {
-            char c = kb_rows[row][col];
-            if (!s_shift_active && c >= 'A' && c <= 'Z') c = c + 32;
-
-            int x = KB_START_X + col * (KB_KEY_W + KB_GAP);
-            int y = KB_START_Y + row * (KB_KEY_H + KB_GAP);
-
-            lcd.fillRoundRect(x, y, KB_KEY_W, KB_KEY_H, 4, TFT_DARKGREY);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.setTextDatum(MC_DATUM);
-
-            char key_str[2] = {c, '\0'};
-            lcd.drawString(key_str, x + KB_KEY_W / 2, y + KB_KEY_H / 2 + 1);
-        }
-    }
-
-    int y5 = KB_START_Y + 4 * (KB_KEY_H + KB_GAP);
-
-    // Shift
-    lcd.fillRoundRect(KB_START_X, y5, KB_SPECIAL_W, KB_KEY_H, 4,
-                      s_shift_active ? 0x07E0 : TFT_DARKGREY);
-    lcd.setTextColor(s_shift_active ? TFT_BLACK : TFT_WHITE);
-    lcd.setTextDatum(MC_DATUM);
-    lcd.drawString("ABC", KB_START_X + KB_SPECIAL_W / 2, y5 + KB_KEY_H / 2 + 1);
-
-    // Space
-    lcd.fillRoundRect(KB_START_X + KB_SPECIAL_W + KB_GAP, y5,
-                      KB_SPECIAL_W, KB_KEY_H, 4, TFT_DARKGREY);
-    lcd.setTextColor(TFT_WHITE);
-    lcd.drawString("___",
-                   KB_START_X + KB_SPECIAL_W + KB_GAP + KB_SPECIAL_W / 2,
-                   y5 + KB_KEY_H / 2 + 1);
-
-    // Backspace
-    lcd.fillRoundRect(KB_START_X + 2 * (KB_SPECIAL_W + KB_GAP), y5,
-                      KB_SPECIAL_W, KB_KEY_H, 4, TFT_DARKGREY);
-    lcd.setTextColor(TFT_WHITE);
-    lcd.drawString("<-",
-                   KB_START_X + 2 * (KB_SPECIAL_W + KB_GAP) + KB_SPECIAL_W / 2,
-                   y5 + KB_KEY_H / 2 + 1);
-
-    lcd.setTextDatum(TL_DATUM);
-}
-
-// ============================================================
-// Отрисовка кнопок Wi-Fi (template)
-// ============================================================
-template <typename T>
-static void draw_wifi_action_buttons_impl(T& lcd) {
-    // Статус WiFi соединения
-    lcd.setFont(&fonts::efontCN_14);
-    lcd.setTextDatum(TL_DATUM);
-
-    if (wifi_is_connected()) {
-        lcd.setTextColor(0x07E0);
-        lcd.drawString("WiFi: подключен", 10, 102);
-    } else {
-        lcd.setTextColor(TFT_RED);
-        lcd.drawString("WiFi: не подключен", 10, 102);
-    }
-
-    // Результат теста
-    if (s_wifi_test_result == WIFI_TEST_IN_PROGRESS) {
-        lcd.setTextColor(TFT_YELLOW);
-        lcd.drawString("Тест: выполняется...", 10, 122);
-    } else if (s_wifi_test_result == WIFI_TEST_SUCCESS) {
-        lcd.setTextColor(0x07E0);
-        lcd.drawString("Тест: успешно", 10, 122);
-    } else if (s_wifi_test_result == WIFI_TEST_FAILED_AUTH) {
-        lcd.setTextColor(TFT_RED);
-        lcd.drawString("Тест: неверный пароль", 10, 122);
-    } else if (s_wifi_test_result == WIFI_TEST_FAILED_NOT_FOUND) {
-        lcd.setTextColor(TFT_RED);
-        lcd.drawString("Тест: сеть не найдена", 10, 122);
-    } else if (s_wifi_test_result == WIFI_TEST_FAILED_TIMEOUT) {
-        lcd.setTextColor(TFT_RED);
-        lcd.drawString("Тест: таймаут", 10, 122);
-    } else if (s_wifi_test_result == WIFI_TEST_FAILED_OTHER) {
-        lcd.setTextColor(TFT_RED);
-        lcd.drawString("Тест: ошибка подключения", 10, 122);
-    }
-
-    // Кнопки действий
-    lcd.setFont(&fonts::Font2);
-    lcd.setTextDatum(MC_DATUM);
-
-    // Revert
-    lcd.fillRoundRect(WIFI_BTN_X, WIFI_BTN_Y, WIFI_BTN_W, WIFI_BTN_H, 5, TFT_RED);
-    lcd.setTextColor(TFT_WHITE);
-    lcd.drawString("Revert",
-                   WIFI_BTN_X + WIFI_BTN_W / 2,
-                   WIFI_BTN_Y + WIFI_BTN_H / 2);
-
-    // Save
-    lcd.fillRoundRect(WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP,
-                      WIFI_BTN_Y,
-                      WIFI_BTN_W,
-                      WIFI_BTN_H,
-                      5,
-                      TFT_BLUE);
-    lcd.setTextColor(TFT_WHITE);
-    lcd.drawString("Save",
-                   WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP + WIFI_BTN_W / 2,
-                   WIFI_BTN_Y + WIFI_BTN_H / 2);
-
-    // Test
-    lcd.fillRoundRect(WIFI_BTN_X,
-                      WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP,
-                      WIFI_BTN_W,
-                      WIFI_BTN_H,
-                      5,
-                      TFT_ORANGE);
-    lcd.setTextColor(TFT_BLACK);
-    lcd.drawString("Test",
-                   WIFI_BTN_X + WIFI_BTN_W / 2,
-                   WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP + WIFI_BTN_H / 2);
-
-    // Connect
-    lcd.fillRoundRect(WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP,
-                      WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP,
-                      WIFI_BTN_W,
-                      WIFI_BTN_H,
-                      5,
-                      0x07E0);
-    lcd.setTextColor(TFT_BLACK);
-    lcd.drawString("Connect",
-                   WIFI_BTN_X + WIFI_BTN_W + WIFI_BTN_GAP + WIFI_BTN_W / 2,
-                   WIFI_BTN_Y + WIFI_BTN_H + WIFI_BTN_GAP + WIFI_BTN_H / 2);
-
-    lcd.setTextDatum(TL_DATUM);
 }
 
 // ============================================================
@@ -800,6 +640,40 @@ static void draw_wifi_keyboard_impl(T& lcd) {
 }
 
 // ============================================================
+// Экран "О программе": палитра и хелперы
+// ============================================================
+static constexpr uint16_t ABOUT_ACCENT = 0x07E0;   // фирменный зелёный
+static constexpr uint16_t ABOUT_DIM    = 0x03E0;   // тёмно-зелёный, разделители
+static constexpr uint16_t ABOUT_LABEL  = TFT_LIGHTGRAY;
+static constexpr uint16_t ABOUT_VALUE  = TFT_WHITE;
+
+template <typename T>
+static void about_section(T& lcd, int y, const char* title) {
+    lcd.setFont(&fonts::efontCN_14);
+    lcd.setTextDatum(TL_DATUM);
+    // маленький зелёный маркер перед заголовком секции
+    lcd.fillRect(10, y + 2, 4, 8, ABOUT_ACCENT);
+    lcd.setTextColor(ABOUT_ACCENT);
+    lcd.drawString(title, 18, y);
+    // Линия-разделитель теперь ближе к тексту (y + 15 вместо y + 16)
+    lcd.drawLine(10, y + 15, 310, y + 15, ABOUT_DIM);
+}
+
+template <typename T>
+static void about_row(T& lcd, int y, const char* label, const char* value,
+                      uint16_t color = ABOUT_VALUE) {
+    lcd.setFont(&fonts::efontCN_14);
+    // подпись слева, тускло
+    lcd.setTextDatum(TL_DATUM);
+    lcd.setTextColor(ABOUT_LABEL);
+    lcd.drawString(label, 18, y);
+    // значение справа, акцентным цветом
+    lcd.setTextColor(color);
+    lcd.setTextDatum(TR_DATUM);
+    lcd.drawString(value, 306, y);
+    lcd.setTextDatum(TL_DATUM);
+}
+// ============================================================
 // Отрисовка UI (template)
 // ============================================================
 template <typename T>
@@ -1109,18 +983,89 @@ static void draw_ui_impl(T& lcd) {
             y += 32;
         }
     }
+
     // ========================================================
-    // About (Заглушка, полноценный экран сделаем в Step 4.2)
+    // About Screen (Без заголовка, компактная вёрстка)
     // ========================================================
     else if (s_current_mode == MODE_ABOUT) {
-        lcd.setFont(&fonts::efontCN_14);
-        lcd.setTextColor(0x07E0);
-        lcd.drawString("О программе", 10, 48);
-        lcd.setTextColor(TFT_WHITE);
-        lcd.drawString("M5Core S3 Radio", 15, 80);
-        lcd.drawString("FW: v1.0.0 (Sprint 3)", 15, 110);
-        lcd.drawString("Stations: 450", 15, 140);
-        lcd.drawString("Нажми для выхода", 15, 200);
+        char line[64];
+
+        // ---- СИСТЕМА ----
+        // Начинаем сразу под верхними вкладками (y=40)
+        about_section(lcd, 42, "СИСТЕМА");
+
+        const esp_app_desc_t* app = esp_app_get_description();
+        about_row(lcd, 59, "FW", app->version, ABOUT_ACCENT);
+
+        snprintf(line, sizeof(line), "%s %s", app->date, app->time);
+        about_row(lcd, 74, "Build", line);
+
+        uint64_t up_s = (uint64_t)(esp_timer_get_time() / 1000000);
+        uint32_t uh = (uint32_t)(up_s / 3600);
+        uint32_t um = (uint32_t)((up_s / 60) % 60);
+        uint32_t us = (uint32_t)(up_s % 60);
+        if (uh > 0) {
+            snprintf(line, sizeof(line), "%uh %um %us", (unsigned int)uh, (unsigned int)um, (unsigned int)us);
+        } else {
+            snprintf(line, sizeof(line), "%um %us", (unsigned int)um, (unsigned int)us);
+        }
+        about_row(lcd, 89, "Аптайм", line);
+
+        int  mv  = (int)M5.Power.getBatteryVoltage();
+        int  pct = (int)M5.Power.getBatteryLevel();
+        bool chg = M5.Power.isCharging();
+        if (chg) {
+            snprintf(line, sizeof(line), "%dmV %d%% [USB]", mv, pct);
+        } else {
+            snprintf(line, sizeof(line), "%dmV %d%%", mv, pct);
+        }
+        uint16_t bat_col = (pct > 50) ? ABOUT_ACCENT : (pct > 20 ? TFT_YELLOW : TFT_RED);
+        about_row(lcd, 104, "Батарея", line, bat_col);
+
+        // ---- СЕТЬ ----
+        // Отступ 16 пикселей от последней строки
+        about_section(lcd, 122, "СЕТЬ");
+
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        about_row(lcd, 139, "MAC", line);
+
+        if (wifi_is_connected()) {
+            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            esp_netif_ip_info_t ip_info;
+            if (netif != nullptr && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                snprintf(line, sizeof(line), IPSTR, IP2STR(&ip_info.ip));
+            } else {
+                snprintf(line, sizeof(line), "нет IP");
+            }
+            about_row(lcd, 154, "IP", line, ABOUT_ACCENT);
+
+            int rssi = wifi_get_rssi();
+            snprintf(line, sizeof(line), "%d dBm", rssi);
+            uint16_t rssi_col = (rssi >= -60) ? ABOUT_ACCENT
+                                : (rssi >= -75) ? TFT_YELLOW : TFT_RED;
+            about_row(lcd, 169, "RSSI", line, rssi_col);
+        } else {
+            about_row(lcd, 154, "IP",   "не подключено", TFT_RED);
+            about_row(lcd, 169, "RSSI", "--", TFT_LIGHTGRAY);
+        }
+
+        // ---- КАТАЛОГ ----
+        // Отступ 14 пикселей
+        about_section(lcd, 187, "КАТАЛОГ");
+
+        const char* src = catalog_get_source_str();
+        int total_st = (int)catalog_total_stations();
+        int fav_count = (int)catalog_get_favorites_count();
+
+        // Объединяем в одну строку, чтобы точно влезло
+        snprintf(line, sizeof(line), "%s (%d) | Избр: %d", src, total_st, fav_count);
+        about_row(lcd, 204, "Каталог", line, ABOUT_ACCENT);
+
+        // Итоговая нижняя точка: 204 + 14 (высота шрифта) = 218 пикселей.
+        // До края экрана (240) остаётся 22 пикселя запаса!
     }
     // ========================================================
     // Catalog (Заглушка, обновление из GitHub будет в Step 4.1)
@@ -1320,22 +1265,6 @@ static void draw_ui_impl(T& lcd) {
 // ============================================================
 // Wrapper-функции отрисовки
 // ============================================================
-__attribute__((unused)) static void draw_keyboard() {
-    if (s_use_sprite && s_ui_sprite != nullptr) {
-        draw_keyboard_impl(*s_ui_sprite);
-    } else {
-        draw_keyboard_impl(M5.Lcd);
-    }
-}
-
-__attribute__((unused)) static void draw_wifi_action_buttons() {
-    if (s_use_sprite && s_ui_sprite != nullptr) {
-        draw_wifi_action_buttons_impl(*s_ui_sprite);
-    } else {
-        draw_wifi_action_buttons_impl(M5.Lcd);
-    }
-}
-
 static void draw_ui() {
     if (s_use_sprite && s_ui_sprite != nullptr) {
         draw_ui_impl(*s_ui_sprite);
@@ -1832,16 +1761,13 @@ void ui_get_wifi_credentials(char* ssid, size_t ssid_len, char* pass, size_t pas
 }
 
 void ui_set_wifi_credentials(const char* ssid, const char* pass) {
-    if (ssid) {
-        strcpy(s_wifi_ssid, ssid);
-        strcpy(s_wifi_ssid_original, ssid);
-    }
-    if (pass) {
-        strcpy(s_wifi_pass, pass);
-        strcpy(s_wifi_pass_original, pass);
-    }
-    s_has_unsaved_changes = false;
-    ESP_LOGI(TAG, "UI Wi-Fi credentials synced: SSID='%s'", s_wifi_ssid);
+if (ssid) {
+strcpy(s_wifi_ssid, ssid);
+}
+if (pass) {
+strcpy(s_wifi_pass, pass);
+}
+ESP_LOGI(TAG, "UI Wi-Fi credentials synced: SSID='%s'", s_wifi_ssid);
 }
 
 void ui_set_wifi_test_result(wifi_test_result_t result) {

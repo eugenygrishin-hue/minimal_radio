@@ -8,6 +8,8 @@ idf_component_register(
         "audio_player.cpp"
         "ui_manager.cpp"
         "sd_manager.cpp"
+        "m3u_parser.cpp" 
+        "m3u_parser.cpp" 
         "catalog_manager.cpp"
     INCLUDE_DIRS
         "."
@@ -26,4 +28,5 @@ idf_component_register(
         esp-libhelix-mp3
         M5Unified
         mbedtls
+        esp_app_format
 )
