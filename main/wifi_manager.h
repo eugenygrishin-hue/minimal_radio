@@ -50,3 +50,22 @@ int wifi_scan_get_count(void);
  * @brief Получает запись из результатов сканирования по индексу
  */
 const wifi_scan_record_t* wifi_scan_get_record(int index);
+
+// ============================================================
+// Known Networks (Auto-connect & Auto-save)
+// ============================================================
+#define MAX_KNOWN_NETWORKS 10
+
+typedef struct {
+    char ssid[33];
+    char pass[65];
+    bool auto_connect;
+} known_network_t;
+
+bool wifi_known_networks_load(void);
+bool wifi_known_networks_save(void);
+bool wifi_known_networks_add(const char* ssid, const char* pass);
+bool wifi_known_networks_remove(int index);
+int wifi_known_networks_get_count(void);
+const known_network_t* wifi_known_networks_get(int index);
+bool wifi_try_auto_connect(void);

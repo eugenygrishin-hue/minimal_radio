@@ -12,6 +12,15 @@
 #include <time.h>
 #include "esp_sntp.h"
 
+#include "cJSON.h"
+#include "sd_manager.h"
+#include <sys/stat.h> // для mkdir
+
+static known_network_t s_known_networks[MAX_KNOWN_NETWORKS];
+static int s_known_networks_count = 0;
+static char s_last_attempted_ssid[33] = {0};
+static char s_last_attempted_pass[65] = {0};
+
 static const char* TAG = "WIFI";
 
 static EventGroupHandle_t s_wifi_event_group = NULL;
@@ -107,6 +116,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
 
 void wifi_connect(const char* ssid, const char* pass) {
     ESP_LOGI(TAG, "Connecting to Wi-Fi: SSID='%s'", ssid);
+
+    // Запоминаем креды для авто-сохранения при успешном подключении
+    strncpy(s_last_attempted_ssid, ssid, sizeof(s_last_attempted_ssid) - 1);
+    strncpy(s_last_attempted_pass, pass, sizeof(s_last_attempted_pass) - 1);
+
     s_connection_attempts = 0;
 
     if (s_wifi_event_group == NULL) {
@@ -373,4 +387,141 @@ int wifi_scan_get_count(void) {
 const wifi_scan_record_t* wifi_scan_get_record(int index) {
     if (index < 0 || index >= s_scan_count) return NULL;
     return &s_scan_results[index];
+}
+
+// ============================================================
+// Known Networks Implementation
+// ============================================================
+bool wifi_known_networks_load(void) {
+    if (!sd_manager_is_mounted()) return false;
+    size_t len = 0;
+    char* text = sd_manager_read_text("/sd/radio/known_networks.json", &len);
+    if (!text) return false;
+
+    cJSON* root = cJSON_Parse(text);
+    free(text);
+    if (!root) return false;
+
+    s_known_networks_count = 0;
+    cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "networks");
+    if (cJSON_IsArray(arr)) {
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, arr) {
+            if (s_known_networks_count < MAX_KNOWN_NETWORKS) {
+                cJSON* ssid = cJSON_GetObjectItemCaseSensitive(item, "ssid");
+                cJSON* pass = cJSON_GetObjectItemCaseSensitive(item, "pass");
+                cJSON* auto_conn = cJSON_GetObjectItemCaseSensitive(item, "auto");
+
+                if (cJSON_IsString(ssid) && cJSON_IsString(pass)) {
+                    strncpy(s_known_networks[s_known_networks_count].ssid, ssid->valuestring, 32);
+                    strncpy(s_known_networks[s_known_networks_count].pass, pass->valuestring, 64);
+                    s_known_networks[s_known_networks_count].auto_connect = cJSON_IsTrue(auto_conn);
+                    s_known_networks_count++;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
+bool wifi_known_networks_save(void) {
+    if (!sd_manager_is_mounted()) return false;
+    mkdir("/sd/radio", 0777); // Гарантируем наличие папки
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON* arr = cJSON_CreateArray();
+    for (int i = 0; i < s_known_networks_count; i++) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "ssid", s_known_networks[i].ssid);
+        cJSON_AddStringToObject(item, "pass", s_known_networks[i].pass);
+        cJSON_AddBoolToObject(item, "auto", s_known_networks[i].auto_connect);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddItemToObject(root, "networks", arr);
+
+    char* out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    bool ok = sd_manager_write_text("/sd/radio/known_networks.json", out);
+    cJSON_free(out);
+    return ok;
+}
+
+bool wifi_known_networks_add(const char* ssid, const char* pass) {
+    if (!ssid || !pass) return false;
+
+    // Проверяем, есть ли уже такая сеть
+    for (int i = 0; i < s_known_networks_count; i++) {
+        if (strcmp(s_known_networks[i].ssid, ssid) == 0) {
+            // Обновляем пароль на всякий случай и включаем авто-подключение
+            strncpy(s_known_networks[i].pass, pass, sizeof(s_known_networks[i].pass) - 1);
+            s_known_networks[i].auto_connect = true;
+            return wifi_known_networks_save();
+        }
+    }
+
+    // Добавляем новую
+    if (s_known_networks_count < MAX_KNOWN_NETWORKS) {
+        strncpy(s_known_networks[s_known_networks_count].ssid, ssid, sizeof(s_known_networks[s_known_networks_count].ssid) - 1);
+        strncpy(s_known_networks[s_known_networks_count].pass, pass, sizeof(s_known_networks[s_known_networks_count].pass) - 1);
+        s_known_networks[s_known_networks_count].auto_connect = true;
+        s_known_networks_count++;
+        return wifi_known_networks_save();
+    }
+    return false;
+}
+
+bool wifi_known_networks_remove(int index) {
+    if (index < 0 || index >= s_known_networks_count) return false;
+
+    // Сдвигаем массив
+    for (int i = index; i < s_known_networks_count - 1; i++) {
+        s_known_networks[i] = s_known_networks[i + 1];
+    }
+    s_known_networks_count--;
+    return wifi_known_networks_save();
+}
+
+int wifi_known_networks_get_count(void) {
+    return s_known_networks_count;
+}
+
+const known_network_t* wifi_known_networks_get(int index) {
+    if (index < 0 || index >= s_known_networks_count) return NULL;
+    return &s_known_networks[index];
+}
+
+bool wifi_try_auto_connect(void) {
+    if (s_known_networks_count == 0) return false;
+
+    ESP_LOGI(TAG, "Scanning for known networks...");
+    int count = wifi_scan_networks();
+    if (count <= 0) return false;
+
+    int best_rssi = -1000;
+    int best_net_idx = -1;
+
+    for (int i = 0; i < count; i++) {
+        const wifi_scan_record_t* rec = wifi_scan_get_record(i);
+        if (!rec) continue;
+
+        for (int j = 0; j < s_known_networks_count; j++) {
+            if (s_known_networks[j].auto_connect && strcmp(rec->ssid, s_known_networks[j].ssid) == 0) {
+                if (rec->rssi > best_rssi) {
+                    best_rssi = rec->rssi;
+                    best_net_idx = j;
+                }
+            }
+        }
+    }
+
+    if (best_net_idx >= 0) {
+        ESP_LOGI(TAG, "Auto-connecting to best known network: %s (RSSI: %d)",
+                 s_known_networks[best_net_idx].ssid, best_rssi);
+        wifi_connect(s_known_networks[best_net_idx].ssid, s_known_networks[best_net_idx].pass);
+        return true;
+    }
+
+    return false;
 }

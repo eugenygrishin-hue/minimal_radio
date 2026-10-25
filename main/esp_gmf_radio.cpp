@@ -164,8 +164,12 @@ extern "C" void app_main(void) {
         }
     }
 
-    // 5. Подключение к Wi-Fi
-    wifi_connect(g_wifi_ssid, g_wifi_pass);
+    // 5. Подключение к Wi-Fi (с приоритетом авто-подключения)
+    wifi_known_networks_load();
+    if (!wifi_try_auto_connect()) {
+        ESP_LOGI(TAG, "Auto-connect failed or no known networks, falling back to saved credentials");
+        wifi_connect(g_wifi_ssid, g_wifi_pass);
+    }
 
     // Сразу пробуем запустить SNTP, если Wi-Fi поднялся
     if (wifi_is_connected() && !g_sntp_started) {

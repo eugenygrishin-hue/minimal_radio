@@ -25,15 +25,16 @@ typedef enum {
 
 // Режимы UI
 typedef enum {
-    MODE_PLAYBACK,
-    MODE_FAVORITES,   // <-- НОВОЕ
+    MODE_PLAYBACK = 0,
+    MODE_FAVORITES,
     MODE_CATEGORIES,
     MODE_STATIONS,
-    MODE_SETTINGS,     // <-- НОВОЕ (вместо MODE_VOLUME и MODE_WIFI как отдельных верхних вкладок)
-	MODE_WIFI,
-	MODE_VOLUME,
+    MODE_SETTINGS,
+    MODE_WIFI,
+    MODE_CATALOG,
     MODE_ABOUT,
-    MODE_CATALOG
+    MODE_VOLUME,
+    MODE_KNOWN_NETWORKS  // <-- НОВОЕ
 } ui_mode_t;
 
 /**

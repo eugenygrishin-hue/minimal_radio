@@ -28,6 +28,8 @@ static const int WIFI_BTN_W   = 150;
 static const int WIFI_BTN_H   = 26;
 static const int WIFI_BTN_GAP = 10;
 
+static const int WIFI_BTN_ROW2_Y = 148; // <-- НОВОЕ: 112 + 26 + 10
+
 static const int WIFI_FIELD_Y[2] = {58, 84};
 static const int WIFI_FIELD_H = 24;
 
