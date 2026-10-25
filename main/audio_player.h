@@ -49,3 +49,26 @@ int audio_get_volume();
  * @return true если mute активен
  */
 bool audio_is_muted();
+
+// ============================================================
+// Headphone Detection & Output Switching
+// ============================================================
+
+/**
+ * @brief Проверяет, подключены ли наушники.
+ * @return true если наушники подключены
+ */
+bool audio_is_headphone_connected(void);
+
+/**
+ * @brief Переключает аудиовыход между наушниками и динамиком.
+ * @param headphone true = наушники, false = динамик
+ */
+void audio_set_output_headphone(bool headphone);
+
+/**
+ * @brief Возвращает текущий режим выхода.
+ * @return true если наушники, false если динамик
+ */
+bool audio_is_headphone_output(void);
+

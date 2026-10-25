@@ -159,6 +159,12 @@ static bool s_cat_selection_mode = false;
 static size_t s_marked_cat_indices[64];
 static size_t s_marked_cat_count = 0;
 
+// ============================================================
+// Headphone detection state
+// ============================================================
+static bool s_last_headphone_state = false;
+static uint32_t s_headphone_check_counter = 0;
+
 static bool is_cat_marked(size_t idx) {
     for (size_t i = 0; i < s_marked_cat_count; i++) {
         if (s_marked_cat_indices[i] == idx) return true;
@@ -1536,6 +1542,32 @@ void ui_update() {
     static bool     s_display_awake    = true;
 
     M5.update();
+
+    // ========================================================
+    // Headphone detection (проверяем каждые 200 мс)
+    // ========================================================
+    s_headphone_check_counter++;
+    if (s_headphone_check_counter >= 4) { // 4 * 50 мс = 200 мс
+        s_headphone_check_counter = 0;
+
+        bool hp_connected = audio_is_headphone_connected();
+
+        if (hp_connected != s_last_headphone_state) {
+            s_last_headphone_state = hp_connected;
+
+            // Переключаем аудиовыход
+            audio_set_output_headphone(hp_connected);
+
+            // RGB LED индикация через M5Unified
+            if (hp_connected) {
+                M5.Led.setColor(0, 255, 0); // Зелёный = наушники
+                ESP_LOGI(TAG, "Headphones connected -> GREEN LED");
+            } else {
+                M5.Led.setColor(0, 0, 255); // Синий = динамик
+                ESP_LOGI(TAG, "Headphones disconnected -> BLUE LED");
+            }
+        }
+    }
 
     // ========================================================
     // 1. Собираем весь ввод в один снимок кадра

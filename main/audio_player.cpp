@@ -329,3 +329,41 @@ int audio_get_volume() {
 bool audio_is_muted() {
     return g_is_muted;
 }
+
+// ============================================================
+// Headphone Detection & Output Switching
+// ============================================================
+static bool s_headphone_connected = false;
+static bool s_headphone_output_active = false;
+
+bool audio_is_headphone_connected(void) {
+    // Чтение статуса из регистра ES8388 (регистр 0x15)
+    // На M5CoreS3 SE бит 7 этого регистра часто отражает статус Jack Detect
+    uint8_t status = M5.In_I2C.readRegister8(ES8388_ADDR, 0x15, 100000);
+    bool connected = (status & 0x80) != 0;
+
+    // Если по каким-то причинам регистр не работает, можно временно вернуть false для теста
+    s_headphone_connected = connected;
+    return connected;
+}
+
+void audio_set_output_headphone(bool headphone) {
+    if (s_headphone_output_active == headphone) return; // Уже в нужном режиме
+    s_headphone_output_active = headphone;
+
+    if (headphone) {
+        // Включаем выход на наушники (LOUT2/ROUT2), выключаем динамик
+        M5.In_I2C.writeRegister8(ES8388_ADDR, 0x28, 0x0C, 100000);
+        M5.In_I2C.writeRegister8(ES8388_ADDR, 0x29, 0x00, 100000);
+        ESP_LOGI(TAG, "Audio output switched to HEADPHONE");
+    } else {
+        // Включаем выход на динамик (LOUT1/ROUT1), выключаем наушники
+        M5.In_I2C.writeRegister8(ES8388_ADDR, 0x28, 0xC0, 100000);
+        M5.In_I2C.writeRegister8(ES8388_ADDR, 0x29, 0x38, 100000);
+        ESP_LOGI(TAG, "Audio output switched to SPEAKER");
+    }
+}
+
+bool audio_is_headphone_output(void) {
+    return s_headphone_output_active;
+}
