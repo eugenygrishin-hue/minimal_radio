@@ -722,9 +722,6 @@ static void draw_ui_impl(T& lcd) {
     }
 
     // ========================================================
-    // Wi-Fi режим
-    // ========================================================
-    // ========================================================
     // Wi-Fi Settings
     // ========================================================
     if (s_current_mode == MODE_WIFI) {
@@ -1068,16 +1065,50 @@ static void draw_ui_impl(T& lcd) {
         // До края экрана (240) остаётся 22 пикселя запаса!
     }
     // ========================================================
-    // Catalog (Заглушка, обновление из GitHub будет в Step 4.1)
+    // Catalog Management (Staging)
     // ========================================================
     else if (s_current_mode == MODE_CATALOG) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
-        lcd.drawString("Каталог", 10, 48);
+        lcd.drawString("Управление каталогом", 10, 48);
+
+        lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(TFT_WHITE);
-        lcd.drawString("Обновление из GitHub", 15, 80);
-        lcd.drawString("будет в Step 4.1", 15, 110);
-        lcd.drawString("Нажми для выхода", 15, 200);
+
+        int staging_count = catalog_staging_get_count();
+        char line[64];
+        snprintf(line, sizeof(line), "В буфере: %d станций", staging_count);
+        lcd.drawString(line, 15, 76);
+
+        int y = 100;
+        const char* items[] = {
+            "1. Загрузить РАБОЧИЙ каталог", // <-- НОВОЕ
+            "2. Импортировать M3U с SD",
+            "3. Проверить живые (Validate)",
+            "4. Применить изменения (Merge)",
+            "5. Очистить буфер",
+            "6. Назад"
+        };
+        int count = 6; // <-- Было 5, стало 6
+
+        for (int i = 0; i < count; i++) {
+            const char* label = items[i];
+            char vlabel[64];
+            if (i == 1 && catalog_is_validating()) {
+                snprintf(vlabel, sizeof(vlabel), "2. Идёт проверка %d/%d",
+                         catalog_get_validated_count(), catalog_get_staging_count());
+                label = vlabel;
+            }
+
+            if (i == s_settings_idx) {
+                lcd.setTextColor(TFT_BLACK);
+                lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+            } else {
+                lcd.setTextColor(TFT_WHITE);
+            }
+            lcd.drawString(label, 15, y);
+            y += 32;
+        }
     }
 
     // ========================================================
@@ -1104,55 +1135,78 @@ static void draw_ui_impl(T& lcd) {
         int bar_w = 280;
         int bar_h = 16;
         lcd.drawRoundRect(10, 146, bar_w, bar_h, 4, TFT_WHITE);
-
         int fill_pct = 0;
         if (s_buffer_target > 0) {
             fill_pct = (int)((s_buffer_level * 100) / s_buffer_target);
         }
-
         if (fill_pct > 100) fill_pct = 100;
-
         int fill_w = (fill_pct * bar_w) / 100;
         if (fill_w > 0) {
             lcd.fillRoundRect(10, 146, fill_w, bar_h, 4, 0x07E0);
         }
 
         char buf[48];
-
         lcd.setTextColor(TFT_WHITE);
         snprintf(buf, sizeof(buf), "Buf: %d%% (%lu KB)",
                  fill_pct,
                  (unsigned long)(s_buffer_level / 1024));
         lcd.drawString(buf, 10, 168);
 
-        int net_pct = 0;
-        if (s_net_capacity > 0) {
-            net_pct = (int)((s_net_fill * 100) / s_net_capacity);
-        }
+        // ========================================================
+        // Если идет валидация — показываем прогресс-бар вместо Net/sparkline
+        // ========================================================
+        if (catalog_is_validating()) {
+            int done = catalog_get_validated_count();
+            int total = catalog_get_staging_count();
+            int pct = (total > 0) ? (done * 100 / total) : 0;
 
-        if (net_pct > 100) net_pct = 100;
-
-        if (net_pct == 0) {
-            lcd.setTextColor(TFT_RED);
-        } else if (net_pct < 10) {
-            lcd.setTextColor(TFT_YELLOW);
-        } else {
+            lcd.setFont(&fonts::Font0);
             lcd.setTextColor(0x07E0);
+            lcd.drawString("Validate:", 10, 186);
+
+            // Рамка прогресс-бара (та же геометрия, что и у Buffer)
+            lcd.drawRoundRect(10, 198, 280, 16, 4, TFT_DARKGREY);
+            int vbar_w = (280 * pct) / 100;
+            if (vbar_w > 0) {
+                lcd.fillRoundRect(10, 198, vbar_w, 16, 4, 0x07E0);
+            }
+
+            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString(buf, 10, 218);
+
+        } else {
+            // ========================================================
+            // Обычная сетевая телеметрия
+            // ========================================================
+            int net_pct = 0;
+            if (s_net_capacity > 0) {
+                net_pct = (int)((s_net_fill * 100) / s_net_capacity);
+            }
+            if (net_pct > 100) net_pct = 100;
+
+            if (net_pct == 0) {
+                lcd.setTextColor(TFT_RED);
+            } else if (net_pct < 10) {
+                lcd.setTextColor(TFT_YELLOW);
+            } else {
+                lcd.setTextColor(0x07E0);
+            }
+
+            snprintf(buf, sizeof(buf), "Net: %d%% (%lu KB)",
+                     net_pct,
+                     (unsigned long)(s_net_fill / 1024));
+            lcd.drawString(buf, 10, 186);
+
+            // Мини-график сетевого буфера
+            draw_net_sparkline_impl(lcd, 10, 204, 300, 18);
+
+            lcd.setTextColor(TFT_RED);
+            snprintf(buf, sizeof(buf), "Starve: %lu | Overflow: %lu",
+                     (unsigned long)s_starve_count,
+                     (unsigned long)s_overflow_count);
+            lcd.drawString(buf, 10, 226);
         }
-
-        snprintf(buf, sizeof(buf), "Net: %d%% (%lu KB)",
-                 net_pct,
-                 (unsigned long)(s_net_fill / 1024));
-        lcd.drawString(buf, 10, 186);
-
-        // Мини-график сетевого буфера
-        draw_net_sparkline_impl(lcd, 10, 204, 300, 18);
-
-        lcd.setTextColor(TFT_RED);
-        snprintf(buf, sizeof(buf), "Starve: %lu | Overflow: %lu",
-                 (unsigned long)s_starve_count,
-                 (unsigned long)s_overflow_count);
-        lcd.drawString(buf, 10, 226);
     }
 
     // ========================================================
@@ -1463,12 +1517,15 @@ void ui_update() {
 
                 ui_needs_redraw = true;
             }
-            else if (s_current_mode == MODE_SETTINGS) {
+            else if (s_current_mode == MODE_SETTINGS || s_current_mode == MODE_CATALOG) {
                 s_settings_idx += effective;
-
                 if (s_settings_idx < 0) s_settings_idx = 0;
-                if (s_settings_idx >= 4) s_settings_idx = 3;
-
+                if (s_current_mode == MODE_SETTINGS) {
+                    if (s_settings_idx >= 4) s_settings_idx = 3;  // 4 пункта: 0..3
+                }
+                else if (s_current_mode == MODE_CATALOG) {
+                    if (s_settings_idx >= 5) s_settings_idx = 4;  // 5 пунктов: 0..4
+                }
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
@@ -1639,72 +1696,98 @@ void ui_update() {
         }
     } else {
         if (enc_is_pressed) {
-            if (!enc_long_press_handled) {
-                if (s_current_mode == MODE_STATIONS) {
-                    s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
-                    s_pending_event = UI_EVENT_STATION_CHANGED;
-                    s_current_mode = MODE_PLAYBACK;
-                }
-                else if (s_current_mode == MODE_FAVORITES) {
-                    int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
-
-                    if (global_idx >= 0) {
-                        s_new_station_idx = global_idx;
+                if (!enc_long_press_handled) {
+                    if (s_current_mode == MODE_STATIONS) {
+                        s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
                         s_pending_event = UI_EVENT_STATION_CHANGED;
                         s_current_mode = MODE_PLAYBACK;
                     }
-                }
-                else if (s_current_mode == MODE_CATEGORIES) {
-                    s_current_mode = MODE_STATIONS;
-                    s_ui_station_idx = 0;
-                }
-                else if (s_current_mode == MODE_SETTINGS) {
-                    if (s_settings_idx == 0) {
-                        s_current_mode = MODE_WIFI;
-                        s_wifi_focus = 0;
-                        s_keyboard_active = false;
-                        s_keyboard_target = KB_TARGET_NONE;
-                        s_wifi_show_scan_results = false;
-                        s_wifi_scan_selected_idx = -1;
-                    }
-                    else if (s_settings_idx == 1) {
-                        s_current_mode = MODE_CATALOG;
-                    }
-                    else if (s_settings_idx == 2) {
-                        s_current_mode = MODE_ABOUT;
-                    }
-                    else if (s_settings_idx == 3) {
-                        s_current_mode = MODE_PLAYBACK;
-                    }
-                }
-                else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
-                    s_current_mode = MODE_SETTINGS;
-                }
-                else if (s_current_mode == MODE_WIFI) {
-                    if (s_wifi_show_scan_results) {
-                        wifi_select_scan_result(s_wifi_scan_selected_idx);
-                    }
-                    else if (s_keyboard_active) {
-                        wifi_kb_close();
-                    }
-                    else {
-                        if (s_wifi_focus == 0) {
-                            wifi_kb_open(KB_TARGET_SSID);
-                        }
-                        else if (s_wifi_focus == 1) {
-                            wifi_kb_open(KB_TARGET_PASS);
-                        }
-                        else if (s_wifi_focus == 2) {
-                            ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
-                            ui_trigger_wifi_scan();
-                        }
-                        else if (s_wifi_focus == 3) {
-                            ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
-                            ui_trigger_wifi_connect();
+                    else if (s_current_mode == MODE_FAVORITES) {
+                        int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
+                        if (global_idx >= 0) {
+                            s_new_station_idx = global_idx;
+                            s_pending_event = UI_EVENT_STATION_CHANGED;
+                            s_current_mode = MODE_PLAYBACK;
                         }
                     }
+                    else if (s_current_mode == MODE_CATEGORIES) {
+                        s_current_mode = MODE_STATIONS;
+                        s_ui_station_idx = 0;
+                    }
+                    else if (s_current_mode == MODE_SETTINGS) {
+                        if (s_settings_idx == 0) {
+                            s_current_mode = MODE_WIFI;
+                            s_wifi_focus = 0;
+                            s_keyboard_active = false;
+                            s_keyboard_target = KB_TARGET_NONE;
+                            s_wifi_show_scan_results = false;
+                            s_wifi_scan_selected_idx = -1;
+                        }
+                        else if (s_settings_idx == 1) {
+                            s_current_mode = MODE_CATALOG;
+                            s_settings_idx = 0; // Сбрасываем индекс для подменю
+                        }
+                        else if (s_settings_idx == 2) {
+                            s_current_mode = MODE_ABOUT;
+                        }
+                        else if (s_settings_idx == 3) {
+                            s_current_mode = MODE_PLAYBACK;
+                        }
+                    }
+                    else if (s_current_mode == MODE_CATALOG) {
+                        if (s_settings_idx == 0) {
+                            ESP_LOGI(TAG, "Catalog: Loading working catalog to staging...");
+                            catalog_load_working_to_staging();
+                        }
+                        else if (s_settings_idx == 1) {
+                            ESP_LOGI(TAG, "Catalog: Importing M3U from SD...");
+                            catalog_staging_load_from_m3u_dir(CATALOG_M3U_DIR);
+                        }
+                        else if (s_settings_idx == 2) {
+                            ESP_LOGI(TAG, "Catalog: Starting background validation...");
+                            catalog_start_validation();
+                        }
+                        else if (s_settings_idx == 3) {
+                            ESP_LOGI(TAG, "Catalog: Merging staging to working...");
+                            catalog_staging_merge_to_working();
+                        }
+                        else if (s_settings_idx == 4) {
+                            ESP_LOGI(TAG, "Catalog: Clearing staging...");
+                            catalog_staging_clear();
+                        }
+                        else if (s_settings_idx == 5) {
+                            s_current_mode = MODE_SETTINGS;
+                            s_settings_idx = 1; // Возвращаемся на пункт "Catalog"
+                        }
+                    }
+                    else if (s_current_mode == MODE_ABOUT) {
+                        s_current_mode = MODE_SETTINGS;
+                    }
+                    else if (s_current_mode == MODE_WIFI) {
+                        if (s_wifi_show_scan_results) {
+                            wifi_select_scan_result(s_wifi_scan_selected_idx);
+                        }
+                        else if (s_keyboard_active) {
+                            wifi_kb_close();
+                        }
+                        else {
+                            if (s_wifi_focus == 0) {
+                                wifi_kb_open(KB_TARGET_SSID);
+                            }
+                            else if (s_wifi_focus == 1) {
+                                wifi_kb_open(KB_TARGET_PASS);
+                            }
+                            else if (s_wifi_focus == 2) {
+                                ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
+                                ui_trigger_wifi_scan();
+                            }
+                            else if (s_wifi_focus == 3) {
+                                ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
+                                ui_trigger_wifi_connect();
+                            }
+                        }
+                    }
                 }
-            }
 
             enc_is_pressed = false;
             s_encoder_accumulator = 0;

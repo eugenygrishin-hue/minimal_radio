@@ -1,12 +1,13 @@
 #include "catalog_manager.h"
+#include "m3u_parser.h"        // <-- ДОБАВИТЬ: чтобы видеть m3u_parse_file
+#include "esp_timer.h"         // <-- ДОБАВИТЬ: чтобы видеть esp_timer_get_time
+#include "esp_http_client.h"   // <-- ДОБАВИТЬ: для HTTP валидации
 #include "sd_manager.h"
 #include "config.h"
-
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <cJSON.h>
-#include <sys/stat.h>
-
+#include <sys/stat.h>          // Для mkdir
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,229 +17,9 @@
 
 static const char* TAG = "CATALOG";
 
+static void ensure_sd_radio_dir(void);
+
 catalog_t g_catalog = {};
-
-// === Staging Catalog (в PSRAM) ===
-static catalog_station_t* s_staging_catalog = nullptr;
-static size_t s_staging_count = 0;
-static size_t s_staging_capacity = 0;
-
-static void staging_ensure_capacity(size_t need) {
-    if (need <= s_staging_capacity) return;
-    size_t new_cap = s_staging_capacity ? s_staging_capacity * 2 : 256;
-    while (new_cap < need) new_cap *= 2;
-
-    catalog_station_t* p = (catalog_station_t*)heap_caps_realloc(
-        s_staging_catalog,
-        new_cap * sizeof(catalog_station_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-    );
-    if (p) {
-        s_staging_catalog = p;
-        s_staging_capacity = new_cap;
-    }
-}
-
-// На случай, если config.h уже не экспортирует эти символы явно.
-// Если они уже объявлены в config.h — повторный extern не должен мешать.
-extern const radio_category_t g_categories[];
-extern const int g_category_count;
-
-
-#include "esp_http_client.h"
-#include <strings.h>
-
-static bool catalog_validate_station_url(const char* url) {
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = 5000,
-        .buffer_size = 512,
-        .user_agent = "M5Radio/1.0"
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return false;
-
-    esp_http_client_set_header(client, "Icy-MetaData", "1");
-
-    // Открываем соединение
-    if (esp_http_client_open(client, 0) != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-
-    // Принимаем только 200 OK или 206 Partial Content
-    if (status != 200 && status != 206) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    // Фильтр HTML-заглушек
-    const char* ct = esp_http_client_get_header(client, "Content-Type");
-    if (ct && strcasestr(ct, "text/html")) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    // Читаем первые 512 байт для sniffing
-    uint8_t buf[512];
-    int read_len = esp_http_client_read(client, (char*)buf, sizeof(buf));
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    if (read_len < 4) return false;
-
-    // Проверка магических чисел
-    if (buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') return true;
-    if (buf[0] == 'O' && buf[1] == 'g' && buf[2] == 'g' && buf[3] == 'S') return true;
-    if (buf[0] == 'f' && buf[1] == 'L' && buf[2] == 'a' && buf[3] == 'C') return true;
-    if (buf[0] == '#' && buf[1] == 'E' && buf[2] == 'X' && buf[3] == 'T') return true; // #EXTM3U
-
-    // Проверка синхрослова MP3/AAC (11 бит единиц: 0xFF 0xE_ или 0xFF 0xF_)
-    for (int i = 0; i < read_len - 1 && i < 512; i++) {
-        if (buf[i] == 0xFF && (buf[i+1] & 0xE0) == 0xE0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool catalog_load_staging_from_m3u_dir(const char* dir_path) {
-    catalog_clear_staging();
-    if (!sd_manager_is_mounted()) return false;
-
-    DIR* d = opendir(dir_path);
-    if (!d) {
-        ESP_LOGW(TAG, "Cannot open M3U dir: %s", dir_path);
-        return false;
-    }
-
-    int total_parsed = 0;
-    struct dirent* ent;
-    while ((ent = readdir(d)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-
-        // Простая проверка на .m3u или .m3u8
-        size_t len = strlen(ent->d_name);
-        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".m3u") != 0) continue;
-
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%s", dir_path, ent->d_name);
-
-        // Имя файла без расширения как default_group
-        char group[CATALOG_MAX_CATEGORY_LEN + 1];
-        strncpy(group, ent->d_name, sizeof(group) - 1);
-        group[sizeof(group) - 1] = '\0';
-        char* dot = strrchr(group, '.');
-        if (dot) *dot = '\0';
-
-        // Выделяем временный буфер для парсинга одного файла
-        catalog_station_t* temp_stations = (catalog_station_t*)heap_caps_malloc(
-            500 * sizeof(catalog_station_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-        if (!temp_stations) continue;
-
-        int count = m3u_parse_file(path, group, temp_stations, 500);
-
-        // Копируем в staging
-        for (int i = 0; i < count; i++) {
-            staging_ensure_capacity(s_staging_count + 1);
-            if (s_staging_count < s_staging_capacity) {
-                s_staging_catalog[s_staging_count++] = temp_stations[i];
-                // Переносим группу из name, если парсер сохранил её туда (см. примечание в m3u_parser)
-                // Если m3u_parser не заполняет group, сделаем это здесь:
-                strncpy(s_staging_catalog[s_staging_count-1].group, group, sizeof(s_staging_catalog[0].group) - 1);
-                s_staging_catalog[s_staging_count-1].is_alive = false;
-                s_staging_catalog[s_staging_count-1].last_checked = 0;
-            }
-        }
-        total_parsed += count;
-        heap_caps_free(temp_stations);
-    }
-    closedir(d);
-
-    ESP_LOGI(TAG, "Staging loaded: %d stations from M3U dir", total_parsed);
-    return total_parsed > 0;
-}
-
-int catalog_validate_staging(void) {
-    int validated_count = 0;
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
-
-    for (size_t i = 0; i < s_staging_count; i++) {
-        if (!s_staging_catalog[i].is_alive) {
-            bool alive = catalog_validate_station_url(s_staging_catalog[i].url);
-            s_staging_catalog[i].is_alive = alive;
-            s_staging_catalog[i].last_checked = now;
-            validated_count++;
-
-            ESP_LOGI(TAG, "Validated [%d/%d]: %s -> %s",
-                     (int)(i+1), (int)s_staging_count,
-                     s_staging_catalog[i].name,
-                     alive ? "ALIVE" : "DEAD");
-
-            // Даём задачу UI и Wi-Fi подышать (100 мс)
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-    return validated_count;
-}
-
-bool catalog_merge_staging_to_working(void) {
-    if (!sd_manager_is_mounted()) return false;
-
-    int added_count = 0;
-    int skipped_count = 0;
-
-    for (size_t i = 0; i < s_staging_count; i++) {
-        if (!s_staging_catalog[i].is_alive) continue;
-
-        // Проверяем, есть ли уже такая станция по ID (дедупликация по URL)
-        size_t cat_idx = 0, st_idx = 0;
-        if (catalog_find_station_by_id(s_staging_catalog[i].id, &cat_idx, &st_idx)) {
-            skipped_count++;
-            continue; // Уже есть в основном каталоге
-        }
-
-        // Добавляем в основной каталог
-        if (catalog_add_station(
-            s_staging_catalog[i].group[0] != '\0' ? s_staging_catalog[i].group : "Imported",
-            s_staging_catalog[i].name,
-            s_staging_catalog[i].url,
-            s_staging_catalog[i].bitrate_kbps
-        )) {
-            added_count++;
-        }
-    }
-
-    ESP_LOGI(TAG, "Merge complete: Added %d, Skipped (duplicate) %d", added_count, skipped_count);
-
-    // Сохраняем обновленный основной каталог на SD
-    ensure_sd_radio_dir();
-    bool ok = catalog_save_json_file(CATALOG_JSON_PATH);
-
-    // Очищаем staging после успешного слияния
-    if (ok) {
-        catalog_clear_staging();
-    }
-
-    return ok;
-}
-
-void catalog_clear_staging(void) {
-    if (s_staging_catalog) {
-        heap_caps_free(s_staging_catalog);
-        s_staging_catalog = nullptr;
-    }
-    s_staging_count = 0;
-    s_staging_capacity = 0;
-}
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -1085,6 +866,8 @@ bool catalog_save_json_file(const char* path)
         return false;
     }
 
+    ensure_sd_radio_dir();
+
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) {
         return false;
@@ -1379,6 +1162,7 @@ bool catalog_load_favorites(void)
 void catalog_save_favorites(void)
 {
     if (!sd_manager_is_mounted()) return;
+    ensure_sd_radio_dir();
     cJSON* root = cJSON_CreateObject();
     cJSON* favs = cJSON_CreateArray();
     for (size_t i = 0; i < g_catalog.favorite_count; i++) {
@@ -1454,4 +1238,423 @@ const char* catalog_get_source_str(void) {
         return "SD";
     }
     return "Embedded";
+}
+
+// ============================================================
+// Staging Catalog & Validation (в фоне, чтобы не морозить UI)
+// ============================================================
+static staging_station_t* s_staging = NULL;
+static size_t s_staging_count = 0;
+static size_t s_staging_capacity = 0;
+
+// Переменные для сохранения уровня логирования (чтобы заглушить красный спам при валидации)
+static esp_log_level_t s_old_tls_level;
+static esp_log_level_t s_old_transport_level;
+static esp_log_level_t s_old_http_level;
+
+// Переменные для отслеживания прогресса валидации UI-ем
+static int s_staging_validated_count = 0;
+static int s_staging_total_count = 0;
+static bool s_is_validating = false;
+static TaskHandle_t s_validation_task_handle = NULL;
+
+// Forward declaration
+static void catalog_validation_task(void *pvParameters);
+
+static void staging_ensure_capacity(size_t need) {
+    if (need <= s_staging_capacity) return;
+    size_t new_cap = s_staging_capacity ? s_staging_capacity * 2 : 256;
+    while (new_cap < need) new_cap *= 2;
+
+    staging_station_t* p = (staging_station_t*)heap_caps_realloc(
+        s_staging,
+        new_cap * sizeof(staging_station_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+    if (p) {
+        s_staging = p;
+        s_staging_capacity = new_cap;
+    } else {
+        ESP_LOGE(TAG, "OOM: cannot realloc staging catalog to %d", (int)new_cap);
+    }
+}
+
+void catalog_staging_clear(void) {
+    if (s_staging) {
+        heap_caps_free(s_staging);
+        s_staging = NULL;
+    }
+    s_staging_count = 0;
+    s_staging_capacity = 0;
+    s_staging_validated_count = 0;
+    s_staging_total_count = 0;
+    s_is_validating = false;
+    if (s_validation_task_handle != NULL) {
+        vTaskDelete(s_validation_task_handle);
+        s_validation_task_handle = NULL;
+    }
+    ESP_LOGI(TAG, "Staging catalog cleared");
+}
+
+int catalog_staging_get_count(void) {
+    return (int)s_staging_count;
+}
+
+const staging_station_t* catalog_staging_get_station(int index) {
+    if (index < 0 || (size_t)index >= s_staging_count) return NULL;
+    return &s_staging[index];
+}
+
+bool catalog_is_validating(void) {
+    return s_is_validating;
+}
+
+int catalog_get_validated_count(void) {
+    return s_staging_validated_count;
+}
+
+int catalog_get_staging_count(void) {
+    return (int)s_staging_count;
+}
+
+// Функция, которую вызывает UI для запуска валидации в фоне
+void catalog_start_validation(void) {
+    if (s_staging_count == 0 || s_is_validating) {
+        ESP_LOGW(TAG, "Nothing to validate or already validating");
+        return;
+    }
+
+    // 1. Сохраняем текущие уровни логирования и отключаем спам
+    s_old_tls_level = esp_log_level_get("esp-tls");
+    s_old_transport_level = esp_log_level_get("transport_base");
+    s_old_http_level = esp_log_level_get("HTTP_CLIENT");
+
+    esp_log_level_set("esp-tls", ESP_LOG_NONE);
+    esp_log_level_set("transport_base", ESP_LOG_NONE);
+    esp_log_level_set("HTTP_CLIENT", ESP_LOG_NONE);
+
+    s_staging_validated_count = 0;
+    s_staging_total_count = (int)s_staging_count;
+    s_is_validating = true;
+
+    ESP_LOGI(TAG, "Starting background validation of %d staging stations...", s_staging_total_count);
+
+    xTaskCreatePinnedToCore(
+        catalog_validation_task,
+        "cat_validate",
+        4096,
+        NULL,
+        1, // Низкий приоритет, чтобы не мешать аудио и UI
+        &s_validation_task_handle,
+        1
+    );
+}
+
+bool catalog_staging_load_from_m3u_dir(const char* dir_path) {
+    if (!sd_manager_is_mounted()) {
+        ESP_LOGW(TAG, "SD not mounted, cannot load staging");
+        return false;
+    }
+    catalog_staging_clear(); // Очищаем предыдущий staging
+
+    DIR* d = opendir(dir_path);
+    if (!d) {
+        ESP_LOGW(TAG, "Cannot open M3U dir: %s", dir_path);
+        return false;
+    }
+
+    int total_parsed = 0;
+    struct dirent* ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        size_t len = strlen(ent->d_name);
+        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".m3u") != 0) continue;
+
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", dir_path, ent->d_name);
+
+        // Имя файла без расширения как default_group
+        char group[CATALOG_MAX_CATEGORY_LEN + 1];
+        strncpy(group, ent->d_name, sizeof(group) - 1);
+        group[sizeof(group) - 1] = '\0';
+        char* dot = strrchr(group, '.');
+        if (dot) *dot = '\0';
+
+        // Хак: используем g_catalog как временный буфер для парсинга M3U,
+        // чтобы не дублировать код парсера, но сохраняем его состояние.
+        catalog_category_t* saved_cats = g_catalog.categories;
+        size_t saved_cat_count = g_catalog.category_count;
+        size_t saved_cat_cap = g_catalog.category_capacity;
+        size_t saved_total = g_catalog.total_stations;
+        bool saved_loaded = g_catalog.loaded;
+
+        g_catalog.categories = NULL;
+        g_catalog.category_count = 0;
+        g_catalog.category_capacity = 0;
+        g_catalog.total_stations = 0;
+        g_catalog.loaded = false;
+
+        size_t file_len = 0;
+        char* text = sd_manager_read_text(path, &file_len);
+        bool ok = false;
+        if (text) {
+            ok = catalog_parse_m3u_text(text, group);
+            free(text);
+        }
+
+        if (ok) {
+            // Копируем всё, что распарсилось, в staging
+            for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
+                catalog_category_t* cat = &g_catalog.categories[ci];
+                for (size_t si = 0; si < cat->count; si++) {
+                    catalog_station_t* st = &cat->stations[si];
+
+                    staging_ensure_capacity(s_staging_count + 1);
+                    if (s_staging_count < s_staging_capacity) {
+                        staging_station_t* ss = &s_staging[s_staging_count++];
+                        ss->id = st->id;
+                        strncpy(ss->name, st->name, sizeof(ss->name) - 1);
+                        strncpy(ss->url, st->url, sizeof(ss->url) - 1);
+                        strncpy(ss->group, group, sizeof(ss->group) - 1);
+                        ss->bitrate_kbps = st->bitrate_kbps;
+                        ss->is_alive = false;
+                        ss->last_checked = 0;
+                        total_parsed++;
+                    }
+                }
+            }
+        }
+
+        // Освобождаем память, которую напарсил M3U в g_catalog
+        for (size_t i = 0; i < g_catalog.category_count; i++) {
+            if (g_catalog.categories[i].stations) heap_caps_free(g_catalog.categories[i].stations);
+        }
+        if (g_catalog.categories) heap_caps_free(g_catalog.categories);
+
+        // Восстанавливаем g_catalog
+        g_catalog.categories = saved_cats;
+        g_catalog.category_count = saved_cat_count;
+        g_catalog.category_capacity = saved_cat_cap;
+        g_catalog.total_stations = saved_total;
+        g_catalog.loaded = saved_loaded;
+    }
+
+    closedir(d);
+    ESP_LOGI(TAG, "Staging loaded: %d stations from M3U dir", total_parsed);
+    return total_parsed > 0;
+}
+
+// ============================================================
+// Staging Validation & Merge Implementation
+// ============================================================
+static bool catalog_validate_station_url(const char* url) {
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 1500;
+    config.buffer_size = 512;
+    config.user_agent = "WinampMPEG/5.0";
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return false;
+
+    esp_http_client_set_header(client, "Icy-MetaData", "1");
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+
+    if (status != 200 && status != 206) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    char* ct = nullptr;
+    esp_http_client_get_header(client, "Content-Type", &ct);
+    if (ct && strcasestr(ct, "text/html")) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    uint8_t buf[512];
+    int read_len = esp_http_client_read(client, (char*)buf, sizeof(buf));
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (read_len < 32) return false;
+
+    // Проверка магических чисел
+    if (buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') return true;
+    if (buf[0] == 'O' && buf[1] == 'g' && buf[2] == 'g' && buf[3] == 'S') return true;
+    if (buf[0] == 'f' && buf[1] == 'L' && buf[2] == 'a' && buf[3] == 'C') return true;
+    if (buf[0] == '#' && buf[1] == 'E' && buf[2] == 'X' && buf[3] == 'T') return true;
+
+    for (int i = 0; i < read_len - 1 && i < 512; i++) {
+        if (buf[i] == 0xFF && (buf[i+1] & 0xE0) == 0xE0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int catalog_staging_validate(void) {
+    if (s_staging_count == 0) {
+        ESP_LOGW(TAG, "Staging catalog is empty, nothing to validate");
+        return 0;
+    }
+
+    s_is_validating = true;
+    s_staging_total_count = (int)s_staging_count;
+    s_staging_validated_count = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    ESP_LOGI(TAG, "Starting validation of %d staging stations...", (int)s_staging_count);
+
+    int alive_count = 0;
+    for (size_t i = 0; i < s_staging_count; i++) {
+        if (!s_staging[i].is_alive) {
+            bool alive = catalog_validate_station_url(s_staging[i].url);
+            s_staging[i].is_alive = alive;
+            s_staging[i].last_checked = now;
+            if (alive) alive_count++;
+        }
+        s_staging_validated_count++;
+
+        // Даем 50 мс на отрисовку UI и работу аудио-декодера
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    s_is_validating = false;
+    ESP_LOGI(TAG, "Validation complete: %d alive out of %d checked", alive_count, (int)s_staging_count);
+    return (int)s_staging_count;
+}
+
+bool catalog_staging_merge_to_working(void) {
+    if (s_staging_count == 0) {
+        ESP_LOGW(TAG, "Staging catalog is empty, nothing to merge");
+        return false;
+    }
+
+    int added_count = 0;
+    int skipped_count = 0;
+    int dead_count = 0;
+
+    ESP_LOGI(TAG, "Merging staging catalog to working catalog...");
+
+    for (size_t i = 0; i < s_staging_count; i++) {
+        if (!s_staging[i].is_alive) {
+            dead_count++;
+            continue;
+        }
+
+        // Проверяем, есть ли уже такая станция по ID (дедупликация по URL)
+        size_t cat_idx = 0, st_idx = 0;
+        if (catalog_find_station_by_id(s_staging[i].id, &cat_idx, &st_idx)) {
+            skipped_count++;
+            continue; // Уже есть в основном каталоге
+        }
+
+        // Добавляем в основной каталог
+        if (catalog_add_station(
+            s_staging[i].group[0] != '\0' ? s_staging[i].group : "Imported",
+            s_staging[i].name,
+            s_staging[i].url,
+            s_staging[i].bitrate_kbps
+        )) {
+            added_count++;
+        }
+    }
+
+    ESP_LOGI(TAG, "Merge complete: Added %d, Skipped (duplicate) %d, Dead %d",
+             added_count, skipped_count, dead_count);
+
+    // Сохраняем обновленный основной каталог на SD
+    ensure_sd_radio_dir();
+    bool ok = catalog_save_json_file(CATALOG_JSON_PATH);
+
+    // Очищаем staging после успешного слияния
+    if (ok) {
+        catalog_staging_clear();
+        ESP_LOGI(TAG, "Staging cleared after successful merge");
+    }
+
+    return ok;
+}
+
+static void catalog_validation_task(void *pvParameters) {
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
+    int alive_count = 0;
+
+    for (size_t i = 0; i < s_staging_count; i++) {
+        if (!s_is_validating) break; // Если очистили каталог во время валидации
+
+        if (!s_staging[i].is_alive) {
+            bool alive = catalog_validate_station_url(s_staging[i].url);
+            s_staging[i].is_alive = alive;
+            s_staging[i].last_checked = now;
+            if (alive) alive_count++;
+        }
+        s_staging_validated_count++;
+
+        // Логируем прогресс каждые 100 станций
+        if (s_staging_validated_count % 100 == 0) {
+            ESP_LOGI(TAG, "Validation progress: %d/%d", s_staging_validated_count, s_staging_total_count);
+        }
+
+        // Даём 50 мс на отрисовку UI и работу аудио-декодера
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // 2. Восстанавливаем уровни логирования обратно
+    esp_log_level_set("esp-tls", s_old_tls_level);
+    esp_log_level_set("transport_base", s_old_transport_level);
+    esp_log_level_set("HTTP_CLIENT", s_old_http_level);
+
+    ESP_LOGI(TAG, "Validation complete: %d alive out of %d checked", alive_count, s_staging_total_count);
+    s_is_validating = false;
+    s_validation_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+
+// ============================================================
+// Загрузка рабочего каталога в Staging (для валидации)
+// ============================================================
+bool catalog_load_working_to_staging(void) {
+    if (!g_catalog.loaded || g_catalog.total_stations == 0) {
+        ESP_LOGW(TAG, "Working catalog is empty, nothing to load");
+        return false;
+    }
+
+    catalog_staging_clear(); // Очищаем старый staging, если он был
+
+    for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
+        const catalog_category_t* cat = &g_catalog.categories[ci];
+        for (size_t si = 0; si < cat->count; si++) {
+            const catalog_station_t* st = &cat->stations[si];
+
+            staging_ensure_capacity(s_staging_count + 1);
+            if (s_staging_count < s_staging_capacity) {
+                staging_station_t* ss = &s_staging[s_staging_count++];
+                ss->id = st->id;
+                strncpy(ss->name, st->name, sizeof(ss->name) - 1);
+                strncpy(ss->url, st->url, sizeof(ss->url) - 1);
+                strncpy(ss->group, cat->name, sizeof(ss->group) - 1);
+                ss->bitrate_kbps = st->bitrate_kbps;
+                ss->is_alive = false; // Сбрасываем, чтобы валидатор проверил каждую станцию заново
+                ss->last_checked = 0;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Working catalog loaded to staging: %d stations ready for validation", (int)s_staging_count);
+    return s_staging_count > 0;
 }

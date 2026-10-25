@@ -68,27 +68,38 @@ static esp_err_t i2s_ensure_channel(void) {
 }
 
 /**
- * @brief Динамически обновляет частоту дискретизации I2S на лету
- */
+* @brief Динамически обновляет частоту дискретизации I2S на лету
+*/
 static esp_err_t i2s_update_sample_rate(uint32_t sample_rate) {
     if (g_current_sample_rate == sample_rate) {
         return ESP_OK; // Частота не изменилась, ничего не делаем
     }
-
     if (!g_i2s_channel_created) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    // 1. Сначала выключаем канал перед перенастройкой
+    i2s_channel_disable(tx_chan);
+
+    // 2. Перенастраиваем тактирование
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
     clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 
     esp_err_t err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
+
     if (err == ESP_OK) {
         ESP_LOGI(TAG, ">>> I2S sample rate updated to %lu Hz", (unsigned long)sample_rate);
         g_current_sample_rate = sample_rate;
+
+        // 3. КРИТИЧЕСКИ ВАЖНО: Включаем канал обратно после успешной перенастройки!
+        i2s_channel_enable(tx_chan);
+        g_i2s_enabled = true; // Гарантируем, что флаг установлен
     } else {
         ESP_LOGE(TAG, "Failed to reconfig I2S clock to %lu Hz: %s", (unsigned long)sample_rate, esp_err_to_name(err));
+        // На всякий случай включаем канал обратно, чтобы устройство не зависло в тишине при ошибке
+        i2s_channel_enable(tx_chan);
     }
+
     return err;
 }
 
