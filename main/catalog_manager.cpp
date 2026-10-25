@@ -1626,7 +1626,7 @@ static void catalog_validation_task(void *pvParameters) {
 
 
 // ============================================================
-// Загрузка рабочего каталога в Staging (для валидации)
+// Загрузка текущего рабочего каталога в Staging (для очистки)
 // ============================================================
 bool catalog_load_working_to_staging(void) {
     if (!g_catalog.loaded || g_catalog.total_stations == 0) {
@@ -1634,7 +1634,7 @@ bool catalog_load_working_to_staging(void) {
         return false;
     }
 
-    catalog_staging_clear(); // Очищаем старый staging, если он был
+    catalog_staging_clear(); // Очищаем старый буфер
 
     for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
         const catalog_category_t* cat = &g_catalog.categories[ci];
@@ -1649,7 +1649,7 @@ bool catalog_load_working_to_staging(void) {
                 strncpy(ss->url, st->url, sizeof(ss->url) - 1);
                 strncpy(ss->group, cat->name, sizeof(ss->group) - 1);
                 ss->bitrate_kbps = st->bitrate_kbps;
-                ss->is_alive = false; // Сбрасываем, чтобы валидатор проверил каждую станцию заново
+                ss->is_alive = false; // Сбрасываем, чтобы валидатор проверил заново
                 ss->last_checked = 0;
             }
         }
@@ -1657,4 +1657,150 @@ bool catalog_load_working_to_staging(void) {
 
     ESP_LOGI(TAG, "Working catalog loaded to staging: %d stations ready for validation", (int)s_staging_count);
     return s_staging_count > 0;
+}
+
+// ============================================================
+// Групповое удаление станций
+// ============================================================
+bool catalog_remove_stations(const uint32_t* ids, size_t count) {
+    if (ids == nullptr || count == 0) return false;
+
+    size_t removed_count = 0;
+
+    for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
+        catalog_category_t* cat = &g_catalog.categories[ci];
+        size_t new_count = 0;
+
+        for (size_t si = 0; si < cat->count; si++) {
+            bool should_remove = false;
+            for (size_t i = 0; i < count; i++) {
+                if (cat->stations[si].id == ids[i]) {
+                    should_remove = true;
+                    break;
+                }
+            }
+
+            if (!should_remove) {
+                if (new_count != si) {
+                    cat->stations[new_count] = cat->stations[si];
+                }
+                new_count++;
+            } else {
+                removed_count++;
+            }
+        }
+
+        cat->count = new_count;
+    }
+
+    g_catalog.total_stations -= removed_count;
+
+    // Удаляем эти ID из избранного
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = 0; j < g_catalog.favorite_count; j++) {
+            if (g_catalog.favorite_ids[j] == ids[i]) {
+                for (size_t k = j; k < g_catalog.favorite_count - 1; k++) {
+                    g_catalog.favorite_ids[k] = g_catalog.favorite_ids[k + 1];
+                }
+                g_catalog.favorite_count--;
+                break;
+            }
+        }
+    }
+
+    // Сохраняем изменения на SD
+    if (sd_manager_is_mounted()) {
+        ensure_sd_radio_dir();
+        catalog_save_json_file(CATALOG_JSON_PATH);
+        catalog_save_favorites();
+    }
+
+    ESP_LOGI(TAG, "Removed %d stations from catalog", (int)removed_count);
+    return removed_count > 0;
+}
+
+// ============================================================
+// Удаление категории
+// ============================================================
+bool catalog_remove_category(size_t category_index) {
+    if (category_index >= g_catalog.category_count) return false;
+
+    catalog_category_t* cat = &g_catalog.categories[category_index];
+
+    // 1. Удаляем станции внутри категории
+    if (cat->stations) {
+        heap_caps_free(cat->stations);
+        cat->stations = nullptr;
+    }
+    g_catalog.total_stations -= cat->count;
+
+    // 2. Сдвигаем оставшиеся категории, чтобы закрыть дыру
+    for (size_t i = category_index; i < g_catalog.category_count - 1; i++) {
+        g_catalog.categories[i] = g_catalog.categories[i + 1];
+    }
+    g_catalog.category_count--;
+
+    // 3. Сохраняем обновленный каталог на SD
+    if (sd_manager_is_mounted()) {
+        ensure_sd_radio_dir();
+        catalog_save_json_file(CATALOG_JSON_PATH);
+    }
+
+    ESP_LOGI(TAG, "Category removed at index %d", (int)category_index);
+    return true;
+}
+
+// ============================================================
+// Пакетное удаление категорий (с сортировкой индексов)
+// ============================================================
+size_t catalog_remove_categories(const size_t* indices, size_t count) {
+    if (indices == nullptr || count == 0) return 0;
+
+    // Копируем индексы и сортируем по убыванию, чтобы при удалении
+    // индексы не "сдвигались" и мы не удалили не те категории.
+    size_t sorted[64];
+    size_t actual_count = (count > 64) ? 64 : count;
+    for (size_t i = 0; i < actual_count; i++) sorted[i] = indices[i];
+
+    // Простая пузырьковая сортировка по убыванию
+    for (size_t i = 0; i < actual_count - 1; i++) {
+        for (size_t j = 0; j < actual_count - i - 1; j++) {
+            if (sorted[j] < sorted[j + 1]) {
+                size_t temp = sorted[j];
+                sorted[j] = sorted[j + 1];
+                sorted[j + 1] = temp;
+            }
+        }
+    }
+
+    size_t removed = 0;
+    for (size_t i = 0; i < actual_count; i++) {
+        size_t idx = sorted[i];
+        if (idx >= g_catalog.category_count) continue; // Защита от невалидных индексов
+
+        catalog_category_t* cat = &g_catalog.categories[idx];
+
+        // Удаляем станции внутри категории
+        if (cat->stations) {
+            heap_caps_free(cat->stations);
+            cat->stations = nullptr;
+        }
+        g_catalog.total_stations -= cat->count;
+
+        // Сдвигаем оставшиеся категории
+        for (size_t k = idx; k < g_catalog.category_count - 1; k++) {
+            g_catalog.categories[k] = g_catalog.categories[k + 1];
+        }
+        g_catalog.category_count--;
+        removed++;
+    }
+
+    // Сохраняем обновлённый каталог на SD
+    if (removed > 0 && sd_manager_is_mounted()) {
+        ensure_sd_radio_dir();
+        catalog_save_json_file(CATALOG_JSON_PATH);
+    }
+
+    ESP_LOGI(TAG, "Removed %d categories", (int)removed);
+    return removed;
 }

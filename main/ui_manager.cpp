@@ -146,6 +146,74 @@ static bool read_hmi_register_8(uint8_t reg) {
 }
 
 // ============================================================
+// Режим выделения станций для группового удаления
+// ============================================================
+static bool s_selection_mode = false;
+static uint32_t s_marked_ids[64];
+static size_t s_marked_count = 0;
+
+// ============================================================
+// Режим выделения категорий для группового удаления
+// ============================================================
+static bool s_cat_selection_mode = false;
+static size_t s_marked_cat_indices[64];
+static size_t s_marked_cat_count = 0;
+
+static bool is_cat_marked(size_t idx) {
+    for (size_t i = 0; i < s_marked_cat_count; i++) {
+        if (s_marked_cat_indices[i] == idx) return true;
+    }
+    return false;
+}
+
+static void toggle_cat_mark(size_t idx) {
+    for (size_t i = 0; i < s_marked_cat_count; i++) {
+        if (s_marked_cat_indices[i] == idx) {
+            for (size_t j = i; j < s_marked_cat_count - 1; j++) {
+                s_marked_cat_indices[j] = s_marked_cat_indices[j + 1];
+            }
+            s_marked_cat_count--;
+            return;
+        }
+    }
+    if (s_marked_cat_count < 64) {
+        s_marked_cat_indices[s_marked_cat_count++] = idx;
+    }
+}
+
+static void clear_cat_marks() {
+    s_marked_cat_count = 0;
+}
+
+static bool is_station_marked(uint32_t id) {
+    for (size_t i = 0; i < s_marked_count; i++) {
+        if (s_marked_ids[i] == id) return true;
+    }
+    return false;
+}
+
+static void toggle_mark_station(uint32_t id) {
+    // Снимаем отметку, если есть
+    for (size_t i = 0; i < s_marked_count; i++) {
+        if (s_marked_ids[i] == id) {
+            for (size_t j = i; j < s_marked_count - 1; j++) {
+                s_marked_ids[j] = s_marked_ids[j + 1];
+            }
+            s_marked_count--;
+            return;
+        }
+    }
+    // Добавляем отметку
+    if (s_marked_count < 64) {
+        s_marked_ids[s_marked_count++] = id;
+    }
+}
+
+static void clear_marks() {
+    s_marked_count = 0;
+}
+
+// ============================================================
 // Статус-бар: WiFi / время / батарея
 // ============================================================
 template <typename T>
@@ -726,28 +794,21 @@ static void draw_ui_impl(T& lcd) {
     // ========================================================
     // Wi-Fi Settings
     // ========================================================
+    // ========================================================
+    // Wi-Fi Settings & Known Networks
+    // ========================================================
     if (s_current_mode == MODE_WIFI) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
+        if (s_wifi_show_scan_results) lcd.drawString("Найденные сети", 10, 42);
+        else if (s_keyboard_active) lcd.drawString("Ввод Wi-Fi", 10, 42);
+        else lcd.drawString("Настройка Wi-Fi", 10, 42);
 
-        if (s_wifi_show_scan_results) {
-            lcd.drawString("Найденные сети", 10, 42);
-        } else if (s_keyboard_active) {
-            lcd.drawString("Ввод Wi-Fi", 10, 42);
-        } else {
-            lcd.drawString("Настройка Wi-Fi", 10, 42);
-        }
-
-        // ----------------------------------------------------
-        // Режим списка найденных сетей
-        // ----------------------------------------------------
         if (s_wifi_show_scan_results) {
             lcd.setFont(&fonts::efontCN_14);
             lcd.setTextColor(TFT_LIGHTGRAY);
             lcd.drawString("Тап/энкодер - выбрать, A - назад", 10, 58);
-
             int count = wifi_scan_get_count();
-
             if (count == 0) {
                 lcd.setTextColor(TFT_YELLOW);
                 lcd.drawString("Сети не найдены", 15, 90);
@@ -756,19 +817,12 @@ static void draw_ui_impl(T& lcd) {
                 const int list_y = 76;
                 const int item_h = 26;
                 const int visible = 5;
-
                 int start = wifi_scan_view_start();
                 int y = list_y;
-
                 for (int i = start; i < count && i < start + visible; i++) {
                     const wifi_scan_record_t* rec = wifi_scan_get_record(i);
-
-                    if (rec == nullptr) {
-                        continue;
-                    }
-
+                    if (rec == nullptr) continue;
                     bool selected = (i == s_wifi_scan_selected_idx);
-
                     if (selected) {
                         lcd.setTextColor(TFT_BLACK);
                         lcd.fillRoundRect(5, y, 310, item_h - 2, 4, 0x07E0);
@@ -777,36 +831,19 @@ static void draw_ui_impl(T& lcd) {
                         lcd.fillRoundRect(5, y, 310, item_h - 2, 4, TFT_BLACK);
                         lcd.drawRoundRect(5, y, 310, item_h - 2, 4, 0x07E0);
                     }
-
                     char line[64];
                     snprintf(line, sizeof(line), "%s (%d)", rec->ssid, (int)rec->rssi);
-
                     lcd.setFont(&fonts::efontCN_14);
                     lcd.drawString(line, 12, y + 4);
-
                     y += item_h;
                 }
             }
-        }
-
-        // ----------------------------------------------------
-        // Обычный режим: поля ввода + кнопки / клавиатура
-        // ----------------------------------------------------
-        else {
+        } else {
             const char* labels[2] = {"SSID:", "Пароль:"};
             const char* values[2] = {s_wifi_ssid, s_wifi_pass};
-
             for (int i = 0; i < 2; i++) {
-                bool focused;
-
-                if (s_keyboard_active) {
-                    focused = (s_keyboard_target == (i == 0 ? KB_TARGET_SSID : KB_TARGET_PASS));
-                } else {
-                    focused = (s_wifi_focus == i);
-                }
-
+                bool focused = s_keyboard_active ? (s_keyboard_target == (i == 0 ? KB_TARGET_SSID : KB_TARGET_PASS)) : (s_wifi_focus == i);
                 int fy = WIFI_FIELD_Y[i] - 2;
-
                 if (focused) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, fy, 310, WIFI_FIELD_H, 4, 0x07E0);
@@ -815,107 +852,109 @@ static void draw_ui_impl(T& lcd) {
                     lcd.fillRoundRect(5, fy, 310, WIFI_FIELD_H, 4, TFT_BLACK);
                     lcd.drawRoundRect(5, fy, 310, WIFI_FIELD_H, 4, TFT_LIGHTGRAY);
                 }
-
-                // Увеличиваем буферы, чтобы открытый пароль не обрезался слишком рано.
-                char disp[72];
-                disp[0] = '\0';
-
-                // Для SSID всегда показываем как есть.
-                // Для пароля:
-                // - если поле пароля в фокусе -> показываем открытым;
-                // - если не в фокусе -> маскируем звёздочками.
+                char disp[72]; disp[0] = '\0';
                 if (i == 1 && !focused) {
                     int n = (int)strlen(values[i]);
-
-                    if (n > 30) {
-                        n = 30;
-                    }
-
-                    for (int k = 0; k < n; k++) {
-                        disp[k] = '*';
-                    }
-
+                    if (n > 30) n = 30;
+                    for (int k = 0; k < n; k++) disp[k] = '*';
                     disp[n] = '\0';
                 } else {
                     strncpy(disp, values[i], sizeof(disp) - 1);
                     disp[sizeof(disp) - 1] = '\0';
                 }
-
                 char line[96];
                 snprintf(line, sizeof(line), "%s %s", labels[i], disp);
-
                 lcd.setFont(&fonts::efontCN_14);
                 lcd.setTextColor(focused ? TFT_BLACK : TFT_WHITE);
                 lcd.drawString(line, 10, WIFI_FIELD_Y[i] + 2);
 
-                // --------------------------------------------------------
-                // Мигающий курсор: показываем только когда клавиатура активна
-                // и активна именно для этого поля.
-                // --------------------------------------------------------
                 bool cursor_here = false;
-
                 if (s_keyboard_active) {
-                    if (i == 0 && s_keyboard_target == KB_TARGET_SSID) {
-                        cursor_here = true;
-                    }
-
-                    if (i == 1 && s_keyboard_target == KB_TARGET_PASS) {
-                        cursor_here = true;
-                    }
+                    if (i == 0 && s_keyboard_target == KB_TARGET_SSID) cursor_here = true;
+                    if (i == 1 && s_keyboard_target == KB_TARGET_PASS) cursor_here = true;
                 }
-
                 if (cursor_here && s_cursor_blink) {
-                    // Ширина текущей строки текста.
-                    // Если вдруг getUTF8width не скомпилируется, замени на:
-                    // int text_w = lcd.getTextWidth(line);
-                	int text_w = lcd.textWidth(line);
-
+                    int text_w = lcd.textWidth(line);
                     int cursor_x = 10 + text_w + 2;
-
-                    // Не выпускаем курсор за правый край поля.
-                    if (cursor_x > 306) {
-                        cursor_x = 306;
-                    }
-
+                    if (cursor_x > 306) cursor_x = 306;
                     int cursor_y = WIFI_FIELD_Y[i] + 3;
                     int cursor_h = WIFI_FIELD_H - 8;
-
-                    // На зелёном фоне курсор чёрный, на чёрном — белый.
                     uint16_t cursor_color = focused ? TFT_BLACK : TFT_WHITE;
-
                     lcd.fillRect(cursor_x, cursor_y, 2, cursor_h, cursor_color);
                 }
             }
 
-            // Кнопки Scan / Connect рисуем только если клавиатура закрыта
             if (!s_keyboard_active) {
-                const char* btn_labels[2] = {"Scan", "Connect"};
-                const int btn_x[2] = {5, 165};
+                const char* btn_labels[4] = {"Scan", "Connect", "Networks", "Back"};
+                const int btn_x[4] = {5, 165, 5, 165};
+                const int btn_y[4] = {WIFI_BTN_Y, WIFI_BTN_Y, WIFI_BTN_ROW2_Y, WIFI_BTN_ROW2_Y};
 
-                for (int i = 0; i < 2; i++) {
-                    int focus_idx = i + 2; // 2=Scan, 3=Connect
+                for (int i = 0; i < 4; i++) {
+                    int focus_idx = i + 2; // 2=Scan, 3=Connect, 4=Networks, 5=Back
                     bool focused = (s_wifi_focus == focus_idx);
-
                     int bx = btn_x[i];
-                    int by = WIFI_BTN_Y - 2;
+                    int by = btn_y[i];
 
                     if (focused) {
                         lcd.setTextColor(TFT_BLACK);
-                        lcd.fillRoundRect(bx, by, 150, WIFI_BTN_H, 4, 0x07E0);
+                        lcd.fillRoundRect(bx, by, WIFI_BTN_W, WIFI_BTN_H, 4, 0x07E0);
                     } else {
                         lcd.setTextColor(0x07E0);
-                        lcd.fillRoundRect(bx, by, 150, WIFI_BTN_H, 4, TFT_BLACK);
-                        lcd.drawRoundRect(bx, by, 150, WIFI_BTN_H, 4, 0x07E0);
+                        lcd.fillRoundRect(bx, by, WIFI_BTN_W, WIFI_BTN_H, 4, TFT_BLACK);
+                        lcd.drawRoundRect(bx, by, WIFI_BTN_W, WIFI_BTN_H, 4, 0x07E0);
                     }
-
                     lcd.setFont(&fonts::efontCN_14);
                     lcd.setTextDatum(MC_DATUM);
-                    lcd.drawString(btn_labels[i], bx + 75, WIFI_BTN_Y + 10);
-                    lcd.setTextDatum(TL_DATUM);
+                    lcd.drawString(btn_labels[i], bx + WIFI_BTN_W / 2, by + WIFI_BTN_H / 2 + 1);
                 }
+                lcd.setTextDatum(TL_DATUM);
             } else {
                 draw_wifi_keyboard_impl(lcd);
             }
+        }
+    }
+    // ========================================================
+    // Known Networks Management
+    // ========================================================
+    else if (s_current_mode == MODE_KNOWN_NETWORKS) {
+        lcd.setFont(&fonts::efontCN_14);
+        lcd.setTextColor(0x07E0);
+        lcd.drawString("Управление сетями", 10, 48);
+
+        int count = wifi_known_networks_get_count();
+        if (count == 0) {
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.drawString("Нет сохраненных сетей", 15, 80);
+            lcd.drawString("Подключитесь к Wi-Fi, чтобы", 15, 100);
+            lcd.drawString("добавить его в список", 15, 120);
+        } else {
+            int visible = 5;
+            int start = s_settings_idx;
+            if (start > 2) start = s_settings_idx - 2;
+            if (start < 0) start = 0;
+
+            int y = 68;
+            for (int i = start; i < count && i < start + visible; i++) {
+                const known_network_t* net = wifi_known_networks_get(i);
+                if (!net) continue;
+
+                if (i == s_settings_idx) {
+                    lcd.setTextColor(TFT_BLACK);
+                    lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                } else {
+                    lcd.setTextColor(TFT_WHITE);
+                }
+
+                char line[64];
+                snprintf(line, sizeof(line), "%s %s", net->auto_connect ? "[A]" : "[ ]", net->ssid);
+                lcd.drawString(line, 15, y);
+                y += 32;
+            }
+
+            // ИСПРАВЛЕНИЕ: используем efontCN_14 вместо Font0 для поддержки кириллицы
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.setFont(&fonts::efontCN_14);
+            lcd.drawString("A: Удалить сеть | B: Назад", 10, 216);
         }
     }
 
@@ -978,7 +1017,19 @@ static void draw_ui_impl(T& lcd) {
             } else {
                 lcd.setTextColor(TFT_WHITE);
             }
-            lcd.drawString(items[i], 15, y);
+
+            // Для пункта "2. Catalog" показываем прогресс валидации
+            if (i == 1 && catalog_is_validating()) {
+                int done = catalog_get_validated_count();
+                int total = catalog_get_staging_count();
+                int pct = (total > 0) ? (done * 100 / total) : 0;
+                char line[80];
+                snprintf(line, sizeof(line), "Catalog - %d/%d (%d%%)", done, total, pct);
+                lcd.drawString(line, 15, y);
+            } else {
+                lcd.drawString(items[i], 15, y);
+            }
+
             y += 32;
         }
     }
@@ -1066,14 +1117,43 @@ static void draw_ui_impl(T& lcd) {
         // Итоговая нижняя точка: 204 + 14 (высота шрифта) = 218 пикселей.
         // До края экрана (240) остаётся 22 пикселя запаса!
     }
+
     // ========================================================
-    // Catalog Management (Staging)
+    // Catalog Management (Финальная версия с прогресс-баром)
     // ========================================================
     else if (s_current_mode == MODE_CATALOG) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
         lcd.drawString("Управление каталогом", 10, 48);
 
+        // Если идет валидация, показываем прогресс-бар вместо меню
+        if (catalog_is_validating()) {
+            int done = catalog_get_validated_count();
+            int total = catalog_get_staging_count();
+            int pct = (total > 0) ? (done * 100 / total) : 0;
+
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString("Проверка живых станций...", 15, 80);
+
+            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+            int bar_w = (290 * pct) / 100;
+            if (bar_w > 0) {
+                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+            }
+
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+            lcd.setTextDatum(MC_DATUM);
+            lcd.setTextColor(TFT_WHITE); // Белый текст для читаемости
+            lcd.drawString(buf, 160, 122);
+            lcd.setTextDatum(TL_DATUM);
+
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.drawString("Можно слушать радио...", 15, 150);
+            return; // Выходим, не рисуем меню поверх
+        }
+
+        // Обычное меню (когда валидация не идет)
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(TFT_WHITE);
 
@@ -1084,31 +1164,22 @@ static void draw_ui_impl(T& lcd) {
 
         int y = 100;
         const char* items[] = {
-            "1. Загрузить РАБОЧИЙ каталог", // <-- НОВОЕ
+            "1. Загрузить РАБОЧИЙ каталог",
             "2. Импортировать M3U с SD",
             "3. Проверить живые (Validate)",
             "4. Применить изменения (Merge)",
-            "5. Очистить буфер",
-            "6. Назад"
+            "5. Назад"
         };
-        int count = 6; // <-- Было 5, стало 6
+        int count = 5;
 
         for (int i = 0; i < count; i++) {
-            const char* label = items[i];
-            char vlabel[64];
-            if (i == 1 && catalog_is_validating()) {
-                snprintf(vlabel, sizeof(vlabel), "2. Идёт проверка %d/%d",
-                         catalog_get_validated_count(), catalog_get_staging_count());
-                label = vlabel;
-            }
-
             if (i == s_settings_idx) {
                 lcd.setTextColor(TFT_BLACK);
                 lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
             } else {
                 lcd.setTextColor(TFT_WHITE);
             }
-            lcd.drawString(label, 15, y);
+            lcd.drawString(items[i], 15, y);
             y += 32;
         }
     }
@@ -1212,82 +1283,167 @@ static void draw_ui_impl(T& lcd) {
     }
 
     // ========================================================
-    // Categories (со скроллингом)
+    // Categories (со скроллингом и режимом удаления)
     // ========================================================
     else if (s_current_mode == MODE_CATEGORIES) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
-        lcd.drawString("Выберите категорию:", 10, 48);
 
-        int visible_items = 5; // На экране помещается 5 строк (68, 100, 132, 164, 196)
-        int cat_count = (int)catalog_category_count();
-
-        // Вычисляем начальный индекс для отрисовки, чтобы выбранный элемент был виден
-        int start_idx = s_selected_category;
-        if (start_idx > 2) {
-            start_idx = s_selected_category - 2; // Держим выбранную строку примерно 3-й сверху
+        // Заголовок: в режиме выделения показываем счётчик
+        if (s_cat_selection_mode) {
+            char title[80];
+            snprintf(title, sizeof(title), "Категории [ВЫДЕЛЕНИЕ: %d]", (int)s_marked_cat_count);
+            lcd.drawString(title, 10, 48);
+        } else {
+            lcd.drawString("Выберите категорию:", 10, 48);
         }
 
-        int y = 68;
-        for (int i = start_idx; i < cat_count && i < start_idx + visible_items; i++) {
-            const catalog_category_t* c = catalog_get_category(i);
-            if (c == nullptr) continue;
+        int visible_items = 5;
+        int cat_count = (int)catalog_category_count();
+        int total_items = cat_count + 1; // +1 для служебного пункта
 
-            if (i == s_selected_category) {
-                lcd.setTextColor(TFT_BLACK);
-                lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+        int start_idx = s_selected_category;
+        if (start_idx > 2) start_idx = s_selected_category - 2;
+        if (start_idx < 0) start_idx = 0;
+
+        int y = 68;
+        for (int i = start_idx; i < total_items && i < start_idx + visible_items; i++) {
+            if (i < cat_count) {
+                // ---- Обычная категория ----
+                const catalog_category_t* c = catalog_get_category(i);
+                if (c == nullptr) continue;
+
+                bool is_marked = is_cat_marked((size_t)i);
+
+                if (i == s_selected_category) {
+                    lcd.setTextColor(TFT_BLACK);
+                    lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                } else {
+                    lcd.setTextColor(is_marked ? TFT_RED : TFT_WHITE);
+                }
+
+                char display_name[CATALOG_MAX_CATEGORY_LEN + 16];
+                if (s_cat_selection_mode) {
+                    snprintf(display_name, sizeof(display_name), is_marked ? "[x] %s" : "[ ] %s", c->name);
+                } else {
+                    snprintf(display_name, sizeof(display_name), "%s", c->name);
+                }
+                lcd.drawString(display_name, 15, y);
             } else {
-                lcd.setTextColor(TFT_WHITE);
+                // ---- Служебный пункт ----
+                if (i == s_selected_category) {
+                    lcd.setTextColor(TFT_BLACK);
+                    lcd.fillRoundRect(5, y - 5, 310, 26, 4, TFT_YELLOW);
+                } else {
+                    lcd.setTextColor(TFT_YELLOW);
+                }
+
+                char label[64];
+                if (s_cat_selection_mode) {
+                    if (s_marked_cat_count > 0) {
+                        snprintf(label, sizeof(label), "Удалить отмеченные (%d)", (int)s_marked_cat_count);
+                    } else {
+                        snprintf(label, sizeof(label), "Выход из режима выделения");
+                    }
+                } else {
+                    snprintf(label, sizeof(label), ">> Режим выделения");
+                }
+                lcd.drawString(label, 15, y);
             }
-            lcd.drawString(c->name, 15, y);
             y += 32;
         }
     }
 
     // ========================================================
-    // Stations (со скроллингом и индикацией избранного)
+    // Stations (со скроллингом, избранным и режимом выделения)
     // ========================================================
     else if (s_current_mode == MODE_STATIONS) {
         const catalog_category_t* cur_cat = catalog_get_category(s_selected_category);
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
-        lcd.drawString(cur_cat ? cur_cat->name : "---", 10, 48);
+
+        // Заголовок: в режиме выделения показываем счётчик
+        if (s_selection_mode) {
+            char title[80];
+            snprintf(title, sizeof(title), "%s [ВЫДЕЛЕНИЕ: %d]",
+                     cur_cat ? cur_cat->name : "---", (int)s_marked_count);
+            lcd.drawString(title, 10, 48);
+        } else {
+            lcd.drawString(cur_cat ? cur_cat->name : "---", 10, 48);
+        }
 
         int visible_items = 6;
-        int count = cur_cat ? (int)cur_cat->count : 0;
+        int station_count = cur_cat ? (int)cur_cat->count : 0;
+        int total_items = station_count + 1; // +1 для служебного пункта
+
         int start_idx = s_ui_station_idx;
         if (start_idx > 3) {
             start_idx = s_ui_station_idx - 3;
         }
-
         int y = 68;
-        for (int i = start_idx; i < count && i < start_idx + visible_items; i++) {
-            const catalog_station_t* st = catalog_get_station(s_selected_category, i);
-            if (st == nullptr) continue;
 
-            // Проверяем, есть ли станция в избранном
-            bool is_fav = catalog_is_favorite(st->id);
+        for (int i = start_idx; i < total_items && i < start_idx + visible_items; i++) {
+            if (i < station_count) {
+                // ---- Обычная станция ----
+                const catalog_station_t* st = catalog_get_station(s_selected_category, i);
+                if (st == nullptr) continue;
 
-            if (i == s_ui_station_idx) {
-                lcd.setTextColor(TFT_BLACK);
-                lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
+                bool is_fav = catalog_is_favorite(st->id);
+                bool is_marked = is_station_marked(st->id);
+
+                if (i == s_ui_station_idx) {
+                    lcd.setTextColor(TFT_BLACK);
+                    lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
+                } else {
+                    if (is_marked) {
+                        lcd.setTextColor(TFT_RED); // Отмеченные — красные
+                    } else {
+                        lcd.setTextColor(TFT_WHITE);
+                    }
+                }
+
+                lcd.setFont(&fonts::efontCN_16);
+
+                char display_name[CATALOG_MAX_NAME_LEN + 16];
+                if (s_selection_mode) {
+                    // В режиме выделения показываем чекбоксы
+                    if (is_marked) {
+                        snprintf(display_name, sizeof(display_name), "[x] %s", st->name);
+                    } else {
+                        snprintf(display_name, sizeof(display_name), "[ ] %s", st->name);
+                    }
+                } else {
+                    // В обычном режиме показываем звёздочку для избранных
+                    if (is_fav) {
+                        snprintf(display_name, sizeof(display_name), "★ %s", st->name);
+                    } else {
+                        snprintf(display_name, sizeof(display_name), "  %s", st->name);
+                    }
+                }
+
+                lcd.drawString(display_name, 15, y);
             } else {
-                lcd.setTextColor(TFT_WHITE);
+                // ---- Служебный пункт ----
+                if (i == s_ui_station_idx) {
+                    lcd.setTextColor(TFT_BLACK);
+                    lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
+                } else {
+                    lcd.setTextColor(TFT_YELLOW);
+                }
+
+                lcd.setFont(&fonts::efontCN_14);
+                char label[64];
+                if (s_selection_mode) {
+                    if (s_marked_count > 0) {
+                        snprintf(label, sizeof(label), "Удалить отмеченные (%d)", (int)s_marked_count);
+                    } else {
+                        snprintf(label, sizeof(label), "Выход из режима выделения");
+                    }
+                } else {
+                    snprintf(label, sizeof(label), ">> Режим выделения");
+                }
+                lcd.drawString(label, 15, y);
             }
-
-            lcd.setFont(&fonts::efontCN_16);
-
-            // Формируем имя со звёздочкой для выравнивания
-            char display_name[CATALOG_MAX_NAME_LEN + 10];
-            if (is_fav) {
-                // Жёлтая звёздочка, если не выделена, или чёрная, если выделена
-                snprintf(display_name, sizeof(display_name), "★ %s", st->name);
-            } else {
-                // Пробелы для сохранения выравнивания текста
-                snprintf(display_name, sizeof(display_name), "  %s", st->name);
-            }
-
-            lcd.drawString(display_name, 15, y);
             y += 28;
         }
     }
@@ -1483,28 +1639,27 @@ void ui_update() {
         }
 
         if (effective != 0) {
-            if (s_current_mode == MODE_CATEGORIES) {
-                int cat_count = (int)catalog_category_count();
-                s_selected_category += effective;
+        	if (s_current_mode == MODE_CATEGORIES) {
+        	    int cat_count = (int)catalog_category_count();
+        	    int total_items = cat_count + 1; // Учитываем служебный пункт
 
-                if (s_selected_category < 0) s_selected_category = 0;
-                if (cat_count > 0 && s_selected_category >= cat_count) {
-                    s_selected_category = cat_count - 1;
-                }
-
-                ui_needs_redraw = true;
-            }
+        	    s_selected_category += effective;
+        	    if (s_selected_category < 0) s_selected_category = 0;
+        	    if (total_items > 0 && s_selected_category >= total_items) {
+        	        s_selected_category = total_items - 1;
+        	    }
+        	    ui_needs_redraw = true;
+        	}
             else if (s_current_mode == MODE_STATIONS) {
                 const catalog_category_t* ec = catalog_get_category(s_selected_category);
-                int count = ec ? (int)ec->count : 0;
+                int station_count = ec ? (int)ec->count : 0;
+                int total_items = station_count + 1; // +1 для служебного пункта
 
                 s_ui_station_idx += effective;
-
                 if (s_ui_station_idx < 0) s_ui_station_idx = 0;
-                if (count > 0 && s_ui_station_idx >= count) {
-                    s_ui_station_idx = count - 1;
+                if (total_items > 0 && s_ui_station_idx >= total_items) {
+                    s_ui_station_idx = total_items - 1;
                 }
-
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_FAVORITES) {
@@ -1522,43 +1677,27 @@ void ui_update() {
             else if (s_current_mode == MODE_SETTINGS || s_current_mode == MODE_CATALOG) {
                 s_settings_idx += effective;
                 if (s_settings_idx < 0) s_settings_idx = 0;
-                if (s_current_mode == MODE_SETTINGS) {
-                    if (s_settings_idx >= 4) s_settings_idx = 3;  // 4 пункта: 0..3
-                }
-                else if (s_current_mode == MODE_CATALOG) {
-                    if (s_settings_idx >= 5) s_settings_idx = 4;  // 5 пунктов: 0..4
-                }
+                if (s_current_mode == MODE_SETTINGS && s_settings_idx >= 4) s_settings_idx = 3;
+                if (s_current_mode == MODE_CATALOG && s_settings_idx >= 5) s_settings_idx = 4; // <-- Важно!
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
                 if (s_wifi_show_scan_results) {
                     int count = wifi_scan_get_count();
-
                     if (count > 0) {
-                        if (s_wifi_scan_selected_idx < 0) {
-                            s_wifi_scan_selected_idx = 0;
-                        }
-
+                        if (s_wifi_scan_selected_idx < 0) s_wifi_scan_selected_idx = 0;
                         s_wifi_scan_selected_idx += effective;
-
-                        if (s_wifi_scan_selected_idx < 0) {
-                            s_wifi_scan_selected_idx = 0;
-                        }
-
-                        if (s_wifi_scan_selected_idx >= count) {
-                            s_wifi_scan_selected_idx = count - 1;
-                        }
+                        if (s_wifi_scan_selected_idx < 0) s_wifi_scan_selected_idx = 0;
+                        if (s_wifi_scan_selected_idx >= count) s_wifi_scan_selected_idx = count - 1;
                     } else {
                         s_wifi_scan_selected_idx = -1;
                     }
                 } else {
-                    // 0 = SSID, 1 = Password, 2 = Scan, 3 = Connect
+                    // 0=SSID, 1=PASS, 2=Scan, 3=Connect, 4=Networks, 5=Back
                     s_wifi_focus += effective;
-
                     if (s_wifi_focus < 0) s_wifi_focus = 0;
-                    if (s_wifi_focus > 3) s_wifi_focus = 3;
+                    if (s_wifi_focus > 5) s_wifi_focus = 5;
                 }
-
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_VOLUME || s_current_mode == MODE_PLAYBACK) {
@@ -1581,8 +1720,22 @@ void ui_update() {
     // 6. Кнопка A: назад / отмена
     // ========================================================
     if (btn_a_edge) {
-        if (s_current_mode == MODE_WIFI) {
+        if (s_current_mode == MODE_STATIONS && s_selection_mode) {
+            s_selection_mode = false;
+            clear_marks();
+            ESP_LOGI(TAG, "Station selection mode cancelled by button A");
+        }
+        else if (s_current_mode == MODE_CATEGORIES && s_cat_selection_mode) {
+            s_cat_selection_mode = false;
+            clear_cat_marks();
+            ESP_LOGI(TAG, "Category selection mode cancelled by button A");
+        }
+        else if (s_current_mode == MODE_WIFI) {
             wifi_back_action();
+        }
+        else if (s_current_mode == MODE_KNOWN_NETWORKS) {
+            s_current_mode = MODE_WIFI;
+            s_wifi_focus = 4;
         }
         else if (s_current_mode == MODE_PLAYBACK) {
             s_current_mode = MODE_SETTINGS;
@@ -1612,9 +1765,13 @@ void ui_update() {
     // 7. Кнопка B: вперёд
     //    В Wi-Fi тоже делаем безопасный выход, чтобы не было ловушки.
     // ========================================================
-    if (btn_b_edge) {
+    if (btn_b_edge) { // <--- ИСПРАВЛЕНО: здесь должно быть btn_b_edge, а не btn_a_edge!
         if (s_current_mode == MODE_WIFI) {
             wifi_back_action();
+        }
+        else if (s_current_mode == MODE_KNOWN_NETWORKS) {
+            s_current_mode = MODE_WIFI;
+            s_wifi_focus = 4; // Возвращаем фокус на кнопку Networks
         }
         else if (s_current_mode == MODE_PLAYBACK) {
             s_current_mode = MODE_FAVORITES;
@@ -1699,11 +1856,51 @@ void ui_update() {
     } else {
         if (enc_is_pressed) {
                 if (!enc_long_press_handled) {
-                    if (s_current_mode == MODE_STATIONS) {
-                        s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
-                        s_pending_event = UI_EVENT_STATION_CHANGED;
-                        s_current_mode = MODE_PLAYBACK;
-                    }
+                	if (s_current_mode == MODE_STATIONS) {
+                	    const catalog_category_t* cat = catalog_get_category(s_selected_category);
+                	    int station_count = cat ? (int)cat->count : 0;
+
+                	    if (s_ui_station_idx < station_count) {
+                	        // Обычная станция
+                	        if (s_selection_mode) {
+                	            // В режиме выделения: отметить/снять отметку
+                	            const catalog_station_t* st = catalog_get_station(s_selected_category, s_ui_station_idx);
+                	            if (st) {
+                	                toggle_mark_station(st->id);
+                	                ESP_LOGI(TAG, "Station %s %s (marked: %d)",
+                	                         st->name,
+                	                         is_station_marked(st->id) ? "MARKED" : "UNMARKED",
+                	                         (int)s_marked_count);
+                	            }
+                	        } else {
+                	            // Обычный режим: воспроизведение
+                	            s_new_station_idx = (int)catalog_global_index(s_selected_category, s_ui_station_idx);
+                	            s_pending_event = UI_EVENT_STATION_CHANGED;
+                	            s_current_mode = MODE_PLAYBACK;
+                	        }
+                	    } else {
+                	        // Служебный пункт
+                	        if (s_selection_mode) {
+                	            if (s_marked_count > 0) {
+                	                ESP_LOGI(TAG, "Deleting %d marked stations...", (int)s_marked_count);
+                	                catalog_remove_stations(s_marked_ids, s_marked_count);
+                	                clear_marks();
+                	                // Корректируем индекс, если вышли за границы
+                	                const catalog_category_t* new_cat = catalog_get_category(s_selected_category);
+                	                int new_count = new_cat ? (int)new_cat->count : 0;
+                	                if (s_ui_station_idx >= new_count) {
+                	                    s_ui_station_idx = new_count > 0 ? new_count - 1 : 0;
+                	                }
+                	            }
+                	            s_selection_mode = false;
+                	        } else {
+                	            // Входим в режим выделения
+                	            s_selection_mode = true;
+                	            clear_marks();
+                	            ESP_LOGI(TAG, "Selection mode enabled");
+                	        }
+                	    }
+                	}
                     else if (s_current_mode == MODE_FAVORITES) {
                         int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
                         if (global_idx >= 0) {
@@ -1713,8 +1910,43 @@ void ui_update() {
                         }
                     }
                     else if (s_current_mode == MODE_CATEGORIES) {
-                        s_current_mode = MODE_STATIONS;
-                        s_ui_station_idx = 0;
+                        int cat_count = (int)catalog_category_count();
+
+                        if (s_selected_category < cat_count) {
+                            // ---- Нажали на обычную категорию ----
+                            if (s_cat_selection_mode) {
+                                // В режиме выделения: отметить/снять отметку
+                                toggle_cat_mark((size_t)s_selected_category);
+                                ESP_LOGI(TAG, "Category %s %s (marked: %d)",
+                                         catalog_get_category(s_selected_category)->name,
+                                         is_cat_marked((size_t)s_selected_category) ? "MARKED" : "UNMARKED",
+                                         (int)s_marked_cat_count);
+                            } else {
+                                // Обычный режим: переход в список станций
+                                s_current_mode = MODE_STATIONS;
+                                s_ui_station_idx = 0;
+                            }
+                        } else {
+                            // ---- Нажали на служебный пункт ----
+                            if (s_cat_selection_mode) {
+                                if (s_marked_cat_count > 0) {
+                                    ESP_LOGI(TAG, "Deleting %d marked categories...", (int)s_marked_cat_count);
+                                    catalog_remove_categories(s_marked_cat_indices, s_marked_cat_count);
+                                    clear_cat_marks();
+                                    // Корректируем индекс, если вышли за границы
+                                    int new_count = (int)catalog_category_count();
+                                    if (s_selected_category >= new_count) {
+                                        s_selected_category = new_count > 0 ? new_count - 1 : 0;
+                                    }
+                                }
+                                s_cat_selection_mode = false;
+                            } else {
+                                // Входим в режим выделения
+                                s_cat_selection_mode = true;
+                                clear_cat_marks();
+                                ESP_LOGI(TAG, "Category selection mode enabled");
+                            }
+                        }
                     }
                     else if (s_current_mode == MODE_SETTINGS) {
                         if (s_settings_idx == 0) {
@@ -1754,12 +1986,8 @@ void ui_update() {
                             catalog_staging_merge_to_working();
                         }
                         else if (s_settings_idx == 4) {
-                            ESP_LOGI(TAG, "Catalog: Clearing staging...");
-                            catalog_staging_clear();
-                        }
-                        else if (s_settings_idx == 5) {
                             s_current_mode = MODE_SETTINGS;
-                            s_settings_idx = 1; // Возвращаемся на пункт "Catalog"
+                            s_settings_idx = 1; // Возвращаемся на пункт "Catalog" в настройках
                         }
                     }
                     else if (s_current_mode == MODE_ABOUT) {
@@ -1773,12 +2001,8 @@ void ui_update() {
                             wifi_kb_close();
                         }
                         else {
-                            if (s_wifi_focus == 0) {
-                                wifi_kb_open(KB_TARGET_SSID);
-                            }
-                            else if (s_wifi_focus == 1) {
-                                wifi_kb_open(KB_TARGET_PASS);
-                            }
+                            if (s_wifi_focus == 0) wifi_kb_open(KB_TARGET_SSID);
+                            else if (s_wifi_focus == 1) wifi_kb_open(KB_TARGET_PASS);
                             else if (s_wifi_focus == 2) {
                                 ESP_LOGI(TAG, "Wi-Fi Scan requested via encoder");
                                 ui_trigger_wifi_scan();
@@ -1786,6 +2010,13 @@ void ui_update() {
                             else if (s_wifi_focus == 3) {
                                 ESP_LOGI(TAG, "Wi-Fi Connect requested via encoder");
                                 ui_trigger_wifi_connect();
+                            }
+                            else if (s_wifi_focus == 4) {
+                                s_current_mode = MODE_KNOWN_NETWORKS;
+                                s_settings_idx = 0;
+                            }
+                            else if (s_wifi_focus == 5) {
+                                wifi_back_action();
                             }
                         }
                     }

@@ -175,3 +175,26 @@ void catalog_staging_clear(void);
  * @brief Копирует текущий рабочий каталог во временный буфер (Staging) для проверки.
  */
 bool catalog_load_working_to_staging(void);
+
+/**
+ * @brief Удаляет станции с указанными ID из каталога и из избранного.
+ * Сохраняет изменения на SD.
+ * @return true если хотя бы одна станция была удалена
+ */
+bool catalog_remove_stations(const uint32_t* ids, size_t count);
+
+/**
+ * @brief Полностью удаляет категорию и все станции внутри неё.
+ * Сохраняет изменения на SD-карте.
+ */
+bool catalog_remove_category(size_t category_index);
+
+/**
+ * @brief Удаляет несколько категорий по их индексам и все станции внутри них.
+ * Сохраняет изменения на SD-карте.
+ * @param indices Массив индексов категорий для удаления.
+ * @param count Количество индексов в массиве.
+ * @return Количество реально удалённых категорий.
+ */
+size_t catalog_remove_categories(const size_t* indices, size_t count);
+

@@ -14,7 +14,7 @@
 
 #include "cJSON.h"
 #include "sd_manager.h"
-#include <sys/stat.h> // для mkdir
+#include <sys/stat.h>
 
 static known_network_t s_known_networks[MAX_KNOWN_NETWORKS];
 static int s_known_networks_count = 0;
@@ -37,12 +37,10 @@ static volatile wifi_test_result_t s_last_error = WIFI_TEST_NOT_STARTED;
 
 static volatile bool s_manual_reconnect = false;
 static volatile uint8_t s_last_disconnect_reason = 0;
-
 static volatile bool s_test_running = false;
-
 static bool s_sntp_started = false;
 
-static wifi_scan_record_t s_scan_results[20]; // Храним до 20 сетей
+static wifi_scan_record_t s_scan_results[20];
 static int s_scan_count = 0;
 
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
@@ -55,9 +53,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
         s_is_connected = false;
         s_last_disconnect_reason = disconnected->reason;
 
-        // Определяем причину ошибки
-        if (disconnected->reason == WIFI_REASON_AUTH_FAIL ||
-            disconnected->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) {
+        if (disconnected->reason == WIFI_REASON_AUTH_FAIL || disconnected->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) {
             s_last_error = WIFI_TEST_FAILED_AUTH;
         } else if (disconnected->reason == WIFI_REASON_NO_AP_FOUND) {
             s_last_error = WIFI_TEST_FAILED_NOT_FOUND;
@@ -65,33 +61,25 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             s_last_error = WIFI_TEST_FAILED_OTHER;
         }
 
-        // Режим теста
         if (s_testing_mode) {
-            // Игнорируем первое ожидаемое отключение, которое мы сами инициировали
             if (s_test_ignore_disconnect && disconnected->reason == WIFI_REASON_ASSOC_LEAVE) {
                 s_test_ignore_disconnect = false;
-                ESP_LOGI(TAG, "Ignoring expected disconnect at test start");
                 return;
             }
-
             ESP_LOGW(TAG, "Wi-Fi disconnected during test (reason: %d)", disconnected->reason);
             s_test_passed = false;
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             return;
         }
 
-        // Ручной reconnect: не даём обработчику самому дёргать esp_wifi_connect()
         if (s_manual_reconnect) {
-            ESP_LOGI(TAG, "Manual reconnect in progress, skipping auto reconnect (reason: %d)",
-                     disconnected->reason);
+            ESP_LOGI(TAG, "Manual reconnect in progress, skipping auto reconnect (reason: %d)", disconnected->reason);
             return;
         }
 
-        // Обычный режим: авто-реконнект до N попыток
         s_connection_attempts++;
         if (s_connection_attempts <= MAX_CONNECTION_ATTEMPTS) {
-            ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting... (attempt %d/%d, reason: %d)",
-                     s_connection_attempts, MAX_CONNECTION_ATTEMPTS, disconnected->reason);
+            ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting... (attempt %d/%d, reason: %d)", s_connection_attempts, MAX_CONNECTION_ATTEMPTS, disconnected->reason);
             esp_wifi_connect();
         } else {
             ESP_LOGE(TAG, "Wi-Fi connection failed after %d attempts", MAX_CONNECTION_ATTEMPTS);
@@ -106,21 +94,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
         s_last_error = WIFI_TEST_NOT_STARTED;
         s_last_disconnect_reason = 0;
 
+        // АВТО-СОХРАНЕНИЕ: если подключились успешно, добавляем в знакомые сети
+        if (s_last_attempted_ssid[0] != '\0') {
+            wifi_known_networks_add(s_last_attempted_ssid, s_last_attempted_pass);
+        }
+
         if (s_testing_mode) {
             s_test_passed = true;
         }
-
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 void wifi_connect(const char* ssid, const char* pass) {
     ESP_LOGI(TAG, "Connecting to Wi-Fi: SSID='%s'", ssid);
-
-    // Запоминаем креды для авто-сохранения при успешном подключении
     strncpy(s_last_attempted_ssid, ssid, sizeof(s_last_attempted_ssid) - 1);
     strncpy(s_last_attempted_pass, pass, sizeof(s_last_attempted_pass) - 1);
-
     s_connection_attempts = 0;
 
     if (s_wifi_event_group == NULL) {
@@ -157,7 +146,6 @@ void wifi_connect(const char* ssid, const char* pass) {
 }
 
 void wifi_reconnect(const char* ssid, const char* pass) {
-
     if (s_testing_mode || s_test_running) {
         ESP_LOGW(TAG, "Wi-Fi test active, ignoring reconnect request");
         return;
@@ -183,46 +171,27 @@ void wifi_reconnect(const char* ssid, const char* pass) {
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_wifi_connect();
-
-    // Даём событию disconnect спокойно обработаться
     vTaskDelay(pdMS_TO_TICKS(300));
     s_manual_reconnect = false;
 }
 
-bool wifi_is_connected() {
-    return s_is_connected;
-}
-
-wifi_test_result_t wifi_get_last_error() {
-    return s_last_error;
-}
+bool wifi_is_connected() { return s_is_connected; }
+wifi_test_result_t wifi_get_last_error() { return s_last_error; }
 
 bool wifi_wait_connected(uint32_t timeout_ms) {
     if (s_is_connected) return true;
     if (s_wifi_event_group == NULL) return false;
-
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_CONNECTED_BIT,
-        pdFALSE,
-        pdFALSE,
-        pdMS_TO_TICKS(timeout_ms)
-    );
-
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
     return s_is_connected && (bits & WIFI_CONNECTED_BIT);
 }
 
 bool wifi_test_connection(const char* ssid, const char* pass) {
-
     if (s_test_running) {
         ESP_LOGW(TAG, "Wi-Fi test already running, refusing concurrent test");
         return false;
     }
-
     s_test_running = true;
-
     ESP_LOGI(TAG, "Testing Wi-Fi connection: SSID='%s'", ssid);
-
     s_testing_mode = true;
     bool result = false;
 
@@ -241,9 +210,7 @@ bool wifi_test_connection(const char* ssid, const char* pass) {
         strncpy((char*)wc.sta.password, pass, sizeof(wc.sta.password) - 1);
 
         esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wc);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Test set_config failed: %s", esp_err_to_name(err));
-        }
+        if (err != ESP_OK) ESP_LOGW(TAG, "Test set_config failed: %s", esp_err_to_name(err));
 
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -257,81 +224,45 @@ bool wifi_test_connection(const char* ssid, const char* pass) {
             break;
         }
 
-        ESP_LOGW(TAG, "Wi-Fi test attempt %d failed: error=%d, reason=%d",
-                 attempt, s_last_error, s_last_disconnect_reason);
-
-        // Retry только если это не явное "сеть не найдена"
+        ESP_LOGW(TAG, "Wi-Fi test attempt %d failed: error=%d, reason=%d", attempt, s_last_error, s_last_disconnect_reason);
         if (attempt == 1 && s_last_error != WIFI_TEST_FAILED_NOT_FOUND) {
             ESP_LOGW(TAG, "Retrying Wi-Fi test once...");
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-
         break;
     }
 
     s_testing_mode = false;
     s_test_ignore_disconnect = false;
-
-    if (!result && s_last_error == WIFI_TEST_NOT_STARTED) {
-        s_last_error = WIFI_TEST_FAILED_TIMEOUT;
-    }
-
-    if (!result) {
-        ESP_LOGW(TAG, "Wi-Fi test: FAILED (error=%d)", s_last_error);
-    }
-
+    if (!result && s_last_error == WIFI_TEST_NOT_STARTED) s_last_error = WIFI_TEST_FAILED_TIMEOUT;
+    if (!result) ESP_LOGW(TAG, "Wi-Fi test: FAILED (error=%d)", s_last_error);
     s_test_running = false;
     return result;
 }
 
-bool wifi_is_testing() {
-    return s_testing_mode;
-}
+bool wifi_is_testing() { return s_testing_mode; }
 
 int wifi_get_rssi(void) {
     wifi_ap_record_t ap;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        return ap.rssi;
-    }
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ap.rssi;
     return 0;
 }
 
 void wifi_start_sntp(void) {
-    if (s_sntp_started) {
-        return;
-    }
-
-    // Москва, UTC+3.
-    // Если нужен другой пояс — меняй здесь.
+    if (s_sntp_started) return;
     setenv("TZ", "MSK-3", 1);
     tzset();
-
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-
-    // Лучше использовать несколько серверов, если позволяет конфигурация LWIP.
-    // Если компилятор ругнётся на индекс 1 или 2 — оставь только нулевой.
     esp_sntp_setservername(0, "pool.ntp.org");
-
-    // Раскомментируй, если в твоём sdkconfig разрешено несколько SNTP-серверов:
-    // esp_sntp_setservername(1, "time.google.com");
-    // esp_sntp_setservername(2, "ru.pool.ntp.org");
-
     esp_sntp_init();
-
     s_sntp_started = true;
     ESP_LOGI(TAG, "SNTP started, timezone=MSK-3");
 }
 
 int wifi_scan_networks(void) {
     ESP_LOGI(TAG, "Starting Wi-Fi scan...");
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = false
-    };
-
+    wifi_scan_config_t scan_config = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false };
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi scan start failed: %s", esp_err_to_name(err));
@@ -339,10 +270,6 @@ int wifi_scan_networks(void) {
     }
 
     uint16_t ap_count = 20;
-
-    // ✅ ИСПРАВЛЕНИЕ: Выделяем память в куче (Heap), а не на стеке!
-    // sizeof(wifi_ap_record_t) = 128 байт. 20 * 128 = 2560 байт.
-    // Это гарантированно вызывало Stack Overflow в задаче main (размер стека ~3072 байта).
     wifi_ap_record_t *ap_info = (wifi_ap_record_t *)heap_caps_malloc(20 * sizeof(wifi_ap_record_t), MALLOC_CAP_INTERNAL);
     if (!ap_info) {
         ESP_LOGE(TAG, "Failed to allocate memory for Wi-Fi scan results");
@@ -352,7 +279,7 @@ int wifi_scan_networks(void) {
     err = esp_wifi_scan_get_ap_records(&ap_count, ap_info);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi scan get records failed: %s", esp_err_to_name(err));
-        free(ap_info); // Не забываем освободить память при ошибке
+        free(ap_info);
         return -1;
     }
 
@@ -361,11 +288,8 @@ int wifi_scan_networks(void) {
         memcpy(s_scan_results[i].ssid, ap_info[i].ssid, 33);
         s_scan_results[i].rssi = ap_info[i].rssi;
     }
-
-    // ✅ Освобождаем временную память сразу после использования
     free(ap_info);
 
-    // Сортируем по уровню сигнала (от сильного к слабому)
     for (int i = 0; i < s_scan_count - 1; i++) {
         for (int j = 0; j < s_scan_count - i - 1; j++) {
             if (s_scan_results[j].rssi < s_scan_results[j + 1].rssi) {
@@ -375,15 +299,11 @@ int wifi_scan_networks(void) {
             }
         }
     }
-
     ESP_LOGI(TAG, "Wi-Fi scan completed, found %d networks", s_scan_count);
     return s_scan_count;
 }
 
-int wifi_scan_get_count(void) {
-    return s_scan_count;
-}
-
+int wifi_scan_get_count(void) { return s_scan_count; }
 const wifi_scan_record_t* wifi_scan_get_record(int index) {
     if (index < 0 || index >= s_scan_count) return NULL;
     return &s_scan_results[index];
@@ -427,7 +347,7 @@ bool wifi_known_networks_load(void) {
 
 bool wifi_known_networks_save(void) {
     if (!sd_manager_is_mounted()) return false;
-    mkdir("/sd/radio", 0777); // Гарантируем наличие папки
+    mkdir("/sd/radio", 0777);
 
     cJSON* root = cJSON_CreateObject();
     cJSON* arr = cJSON_CreateArray();
@@ -450,18 +370,13 @@ bool wifi_known_networks_save(void) {
 
 bool wifi_known_networks_add(const char* ssid, const char* pass) {
     if (!ssid || !pass) return false;
-
-    // Проверяем, есть ли уже такая сеть
     for (int i = 0; i < s_known_networks_count; i++) {
         if (strcmp(s_known_networks[i].ssid, ssid) == 0) {
-            // Обновляем пароль на всякий случай и включаем авто-подключение
             strncpy(s_known_networks[i].pass, pass, sizeof(s_known_networks[i].pass) - 1);
             s_known_networks[i].auto_connect = true;
             return wifi_known_networks_save();
         }
     }
-
-    // Добавляем новую
     if (s_known_networks_count < MAX_KNOWN_NETWORKS) {
         strncpy(s_known_networks[s_known_networks_count].ssid, ssid, sizeof(s_known_networks[s_known_networks_count].ssid) - 1);
         strncpy(s_known_networks[s_known_networks_count].pass, pass, sizeof(s_known_networks[s_known_networks_count].pass) - 1);
@@ -474,8 +389,6 @@ bool wifi_known_networks_add(const char* ssid, const char* pass) {
 
 bool wifi_known_networks_remove(int index) {
     if (index < 0 || index >= s_known_networks_count) return false;
-
-    // Сдвигаем массив
     for (int i = index; i < s_known_networks_count - 1; i++) {
         s_known_networks[i] = s_known_networks[i + 1];
     }
@@ -483,10 +396,7 @@ bool wifi_known_networks_remove(int index) {
     return wifi_known_networks_save();
 }
 
-int wifi_known_networks_get_count(void) {
-    return s_known_networks_count;
-}
-
+int wifi_known_networks_get_count(void) { return s_known_networks_count; }
 const known_network_t* wifi_known_networks_get(int index) {
     if (index < 0 || index >= s_known_networks_count) return NULL;
     return &s_known_networks[index];
@@ -494,7 +404,6 @@ const known_network_t* wifi_known_networks_get(int index) {
 
 bool wifi_try_auto_connect(void) {
     if (s_known_networks_count == 0) return false;
-
     ESP_LOGI(TAG, "Scanning for known networks...");
     int count = wifi_scan_networks();
     if (count <= 0) return false;
@@ -505,7 +414,6 @@ bool wifi_try_auto_connect(void) {
     for (int i = 0; i < count; i++) {
         const wifi_scan_record_t* rec = wifi_scan_get_record(i);
         if (!rec) continue;
-
         for (int j = 0; j < s_known_networks_count; j++) {
             if (s_known_networks[j].auto_connect && strcmp(rec->ssid, s_known_networks[j].ssid) == 0) {
                 if (rec->rssi > best_rssi) {
@@ -517,11 +425,9 @@ bool wifi_try_auto_connect(void) {
     }
 
     if (best_net_idx >= 0) {
-        ESP_LOGI(TAG, "Auto-connecting to best known network: %s (RSSI: %d)",
-                 s_known_networks[best_net_idx].ssid, best_rssi);
+        ESP_LOGI(TAG, "Auto-connecting to best known network: %s (RSSI: %d)", s_known_networks[best_net_idx].ssid, best_rssi);
         wifi_connect(s_known_networks[best_net_idx].ssid, s_known_networks[best_net_idx].pass);
         return true;
     }
-
     return false;
 }
