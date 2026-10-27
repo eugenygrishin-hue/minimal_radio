@@ -2,6 +2,9 @@
 #include "config.h"
 #include "catalog_manager.h"
 #include "wifi_manager.h"
+
+#include "audio_player.h"
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -1558,12 +1561,12 @@ void ui_update() {
             // Переключаем аудиовыход
             audio_set_output_headphone(hp_connected);
 
-            // RGB LED индикация через M5Unified
+            // RGB LED индикация через M5Unified (индекс 0, затем R, G, B)
             if (hp_connected) {
-                M5.Led.setColor(0, 255, 0); // Зелёный = наушники
+                M5.Led.setColor(0, 0, 255, 0); // index=0, R=0, G=255, B=0 (Зелёный)
                 ESP_LOGI(TAG, "Headphones connected -> GREEN LED");
             } else {
-                M5.Led.setColor(0, 0, 255); // Синий = динамик
+                M5.Led.setColor(0, 0, 0, 255); // index=0, R=0, G=0, B=255 (Синий)
                 ESP_LOGI(TAG, "Headphones disconnected -> BLUE LED");
             }
         }
