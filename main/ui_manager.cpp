@@ -4,6 +4,7 @@
 #include "wifi_manager.h"
 
 #include "audio_player.h"
+#include "audio_output.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -161,12 +162,6 @@ static size_t s_marked_count = 0;
 static bool s_cat_selection_mode = false;
 static size_t s_marked_cat_indices[64];
 static size_t s_marked_cat_count = 0;
-
-// ============================================================
-// Headphone detection state
-// ============================================================
-static bool s_last_headphone_state = false;
-static uint32_t s_headphone_check_counter = 0;
 
 static bool is_cat_marked(size_t idx) {
     for (size_t i = 0; i < s_marked_cat_count; i++) {
@@ -1547,30 +1542,9 @@ void ui_update() {
     M5.update();
 
     // ========================================================
-    // Headphone detection (проверяем каждые 200 мс)
+    // Headphone detection (опрос каждые 200 мс внутри функции)
     // ========================================================
-    s_headphone_check_counter++;
-    if (s_headphone_check_counter >= 4) { // 4 * 50 мс = 200 мс
-        s_headphone_check_counter = 0;
-
-        bool hp_connected = audio_is_headphone_connected();
-
-        if (hp_connected != s_last_headphone_state) {
-            s_last_headphone_state = hp_connected;
-
-            // Переключаем аудиовыход
-            audio_set_output_headphone(hp_connected);
-
-            // RGB LED индикация через M5Unified (индекс 0, затем R, G, B)
-            if (hp_connected) {
-                M5.Led.setColor(0, 0, 255, 0); // index=0, R=0, G=255, B=0 (Зелёный)
-                ESP_LOGI(TAG, "Headphones connected -> GREEN LED");
-            } else {
-                M5.Led.setColor(0, 0, 0, 255); // index=0, R=0, G=0, B=255 (Синий)
-                ESP_LOGI(TAG, "Headphones disconnected -> BLUE LED");
-            }
-        }
-    }
+    audio_output_poll();
 
     // ========================================================
     // 1. Собираем весь ввод в один снимок кадра

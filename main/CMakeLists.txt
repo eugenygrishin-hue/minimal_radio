@@ -6,6 +6,7 @@ idf_component_register(
         "wifi_manager.cpp"
         "http_stream.cpp"
         "audio_player.cpp"
+        "audio_output.cpp" 
         "ui_manager.cpp"
         "sd_manager.cpp"
         "m3u_parser.cpp" 
