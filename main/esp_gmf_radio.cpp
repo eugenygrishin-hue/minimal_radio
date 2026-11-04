@@ -13,6 +13,8 @@
 #include <M5Unified.hpp>
 #include <cstring>
 
+#include "audio_output.h"
+
 static const char* TAG = "MAIN";
 
 #include <stdlib.h>
@@ -185,6 +187,12 @@ extern "C" void app_main(void) {
     }
     audio_init(ringbuf);
     audio_start();
+
+    /*
+     * Синхронизируем UI с реальной громкостью, загруженной из NVS.
+     * Без этого UI останется на жёстком дефолте 75%.
+     */
+    ui_set_volume(audio_output_get_volume());
 
     // 7. Инициализация HTTP стрима
     http_stream_init(ringbuf);
@@ -376,7 +384,7 @@ extern "C" void app_main(void) {
             ;
         }
         else if (event == UI_EVENT_VOLUME_CHANGED) {
-            audio_set_volume(ui_get_volume());
+            audio_output_set_volume((uint8_t)ui_get_volume());
         }
         else if (event == UI_EVENT_MUTE_TOGGLED) {
             audio_toggle_mute();

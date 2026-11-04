@@ -72,6 +72,8 @@ int ui_get_selected_station();
  */
 int ui_get_volume();
 
+void ui_set_volume(int volume_percent);
+
 /**
  * @brief Получение текущих значений Wi-Fi из полей ввода
  */

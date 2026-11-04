@@ -1546,6 +1546,26 @@ void ui_update() {
     // ========================================================
     audio_output_poll();
 
+    /*
+     * При смене активного выхода громкость раздельная,
+     * поэтому отображаемое значение тоже должно измениться.
+     */
+    {
+        static bool s_last_hp = false;
+        static bool s_hp_init = false;
+
+        bool hp = audio_output_is_headphone();
+
+        if (!s_hp_init) {
+            s_hp_init = true;
+            s_last_hp = hp;
+            ui_set_volume(audio_output_get_volume());
+        } else if (hp != s_last_hp) {
+            s_last_hp = hp;
+            ui_set_volume(audio_output_get_volume());
+        }
+    }
+
     // ========================================================
     // 1. Собираем весь ввод в один снимок кадра
     // ========================================================
@@ -1710,12 +1730,18 @@ void ui_update() {
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_VOLUME || s_current_mode == MODE_PLAYBACK) {
-                int new_vol = s_current_volume + effective * 5;
+                /*
+                 * Читаем текущую громкость из аудио-подсистемы,
+                 * а не из локальной переменной UI.
+                 * Это единственный источник правды.
+                 */
+                int cur_vol = audio_output_get_volume();
+                int new_vol = cur_vol + effective * 5;
 
                 if (new_vol < 0) new_vol = 0;
                 if (new_vol > 100) new_vol = 100;
 
-                if (new_vol != s_current_volume) {
+                if (new_vol != cur_vol) {
                     s_current_volume = new_vol;
                     s_new_volume = new_vol;
                     s_pending_event = UI_EVENT_VOLUME_CHANGED;
@@ -2072,6 +2098,15 @@ int ui_get_selected_station() {
 
 int ui_get_volume() {
     return s_new_volume;
+}
+
+void ui_set_volume(int volume_percent)
+{
+    if (volume_percent < 0) volume_percent = 0;
+    if (volume_percent > 100) volume_percent = 100;
+
+    s_current_volume = volume_percent;
+    s_new_volume = volume_percent;
 }
 
 void ui_get_wifi_credentials(char* ssid, size_t ssid_len, char* pass, size_t pass_len) {

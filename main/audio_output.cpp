@@ -17,6 +17,9 @@
 #include <atomic>
 #include <cstdint>
 
+#include <nvs.h>
+#include <nvs_flash.h>
+
 static const char* TAG = "AUDIO_OUT";
 
 /* ----------------------------------------------------------
@@ -93,8 +96,39 @@ static volatile bool s_request_headphone = false;
 /* Есть незавершённое переключение */
 static volatile bool s_pending_switch = false;
 
-static uint8_t  s_volume_percent = 75;
+/* ----------------------------------------------------------
+ * Раздельная громкость.
+ *
+ * Динамик через M5.Speaker/AW88298 обычно гораздо громче,
+ * поэтому стартовое значение для динамика ставим ниже.
+ *
+ * Наушники через ES8388 можно стартовать с более комфортного
+ * среднего уровня.
+ * ---------------------------------------------------------- */
+static constexpr uint8_t DEFAULT_HP_VOLUME_PERCENT  = 70;
+static constexpr uint8_t DEFAULT_SPK_VOLUME_PERCENT = 30;
+
+static uint8_t s_hp_volume_percent  = DEFAULT_HP_VOLUME_PERCENT;
+static uint8_t s_spk_volume_percent = DEFAULT_SPK_VOLUME_PERCENT;
+
+/* ----------------------------------------------------------
+ * NVS persistence for separate volumes.
+ * ---------------------------------------------------------- */
+
+static constexpr const char* NVS_AUDIO_NAMESPACE = "audio";
+static constexpr const char* NVS_KEY_HP_VOL      = "hp_vol";
+static constexpr const char* NVS_KEY_SPK_VOL     = "spk_vol";
+
+static constexpr int64_t VOL_SAVE_DEBOUNCE_US = 1000000; /* 1 sec */
+
 static uint32_t s_sample_rate = SPK_DEFAULT_RATE;
+
+static nvs_handle_t s_nvs = 0;
+static bool s_nvs_opened = false;
+
+static bool s_hp_vol_dirty = false;
+static bool s_spk_vol_dirty = false;
+static int64_t s_vol_last_change_us = 0;
 
 /* I2S для наушников / ES8388 */
 static i2s_chan_handle_t s_hp_chan = nullptr;
@@ -137,6 +171,11 @@ static int64_t s_spk_no_free_since = 0;
  * Вспомогательные функции
  * ---------------------------------------------------------- */
 
+static inline uint8_t current_output_volume_percent(void)
+{
+    return s_current_headphone ? s_hp_volume_percent : s_spk_volume_percent;
+}
+
 static inline uint32_t now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -144,17 +183,17 @@ static inline uint32_t now_ms(void)
 
 static inline uint8_t speaker_volume_255(void)
 {
-    return (uint8_t)((s_volume_percent * 255u) / 100u);
+    return (uint8_t)((s_spk_volume_percent * 255u) / 100u);
 }
 
 static inline uint8_t es8388_volume_reg(void)
 {
     /*
-     * Старая рабочая формула из minimal_radio:
+     * ES8388 / наушники:
      * 100% -> 0x00
      * 0%   -> 0xC0
      */
-    return (uint8_t)(0xC0u - ((uint32_t)s_volume_percent * 0xC0u) / 100u);
+    return (uint8_t)(0xC0u - ((uint32_t)s_hp_volume_percent * 0xC0u) / 100u);
 }
 
 static bool i2c_write8(uint8_t addr, uint8_t reg, uint8_t value, uint32_t freq)
@@ -203,6 +242,131 @@ static bool read_hp_raw(void)
 {
     uint8_t status = i2c_read8(STM32_ADDR, 0x20, 400000);
     return (status == 1);
+}
+
+/* ----------------------------------------------------------
+ * NVS volume persistence
+ * ---------------------------------------------------------- */
+
+static bool audio_nvs_open(void)
+{
+    if (s_nvs_opened) {
+        return true;
+    }
+
+    esp_err_t err = nvs_open(NVS_AUDIO_NAMESPACE, NVS_READWRITE, &s_nvs);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Failed to open NVS namespace '%s': %s",
+                 NVS_AUDIO_NAMESPACE,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    s_nvs_opened = true;
+    return true;
+}
+
+static void audio_volume_load_from_nvs(void)
+{
+    if (!audio_nvs_open()) {
+        return;
+    }
+
+    uint8_t v = 0;
+
+    if (nvs_get_u8(s_nvs, NVS_KEY_HP_VOL, &v) == ESP_OK && v <= 100) {
+        s_hp_volume_percent = v;
+    }
+
+    v = 0;
+
+    if (nvs_get_u8(s_nvs, NVS_KEY_SPK_VOL, &v) == ESP_OK && v <= 100) {
+        s_spk_volume_percent = v;
+    }
+
+    ESP_LOGI(TAG,
+             "Volumes loaded from NVS: hp=%u%% spk=%u%%",
+             (unsigned int)s_hp_volume_percent,
+             (unsigned int)s_spk_volume_percent);
+}
+
+static void audio_volume_mark_changed(bool headphone)
+{
+    if (headphone) {
+        s_hp_vol_dirty = true;
+    } else {
+        s_spk_vol_dirty = true;
+    }
+
+    s_vol_last_change_us = esp_timer_get_time();
+}
+
+static void audio_volume_flush_to_nvs_locked(void)
+{
+    if (!s_hp_vol_dirty && !s_spk_vol_dirty) {
+        return;
+    }
+
+    if (!audio_nvs_open()) {
+        return;
+    }
+
+    if (s_hp_vol_dirty) {
+        esp_err_t err = nvs_set_u8(s_nvs, NVS_KEY_HP_VOL, s_hp_volume_percent);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Failed to save HP volume: %s",
+                     esp_err_to_name(err));
+        } else {
+            s_hp_vol_dirty = false;
+        }
+    }
+
+    if (s_spk_vol_dirty) {
+        esp_err_t err = nvs_set_u8(s_nvs, NVS_KEY_SPK_VOL, s_spk_volume_percent);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Failed to save SPK volume: %s",
+                     esp_err_to_name(err));
+        } else {
+            s_spk_vol_dirty = false;
+        }
+    }
+
+    esp_err_t err = nvs_commit(s_nvs);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Failed to commit audio NVS: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void audio_volume_flush_if_due(void)
+{
+    if (!s_hp_vol_dirty && !s_spk_vol_dirty) {
+        return;
+    }
+
+    if (s_vol_last_change_us == 0) {
+        return;
+    }
+
+    if ((esp_timer_get_time() - s_vol_last_change_us) < VOL_SAVE_DEBOUNCE_US) {
+        return;
+    }
+
+    if (s_mux != nullptr) {
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        audio_volume_flush_to_nvs_locked();
+        xSemaphoreGive(s_mux);
+    } else {
+        audio_volume_flush_to_nvs_locked();
+    }
 }
 
 /* ----------------------------------------------------------
@@ -580,6 +744,11 @@ static bool spk_stream_begin(uint32_t rate)
     M5.Speaker.setVolume(speaker_volume_255());
     M5.Speaker.setAllChannelVolume(255);
 
+    ESP_LOGI(TAG,
+             "SPK backend volume: %u%% raw=%u",
+             (unsigned int)s_spk_volume_percent,
+             (unsigned int)speaker_volume_255());
+
     s_spk_rate = rate;
     s_spk_ready = true;
     spk_pool_reset();
@@ -805,8 +974,11 @@ static void switch_locked(bool to_headphone)
         return;
     }
 
-    ESP_LOGI(TAG, "Switching audio output: %s",
-             to_headphone ? "SPEAKER -> HEADPHONE" : "HEADPHONE -> SPEAKER");
+    ESP_LOGI(TAG,
+             "Switching audio output: %s (hp=%u%% spk=%u%%)",
+             to_headphone ? "SPEAKER -> HEADPHONE" : "HEADPHONE -> SPEAKER",
+             (unsigned int)s_hp_volume_percent,
+             (unsigned int)s_spk_volume_percent);
 
     /* 1. Заглушаем текущий выход */
     if (s_current_headphone) {
@@ -887,9 +1059,14 @@ extern "C" void audio_output_init(void)
     }
 
     s_is_playing = false;
-    s_volume_percent = 75;
+    s_hp_volume_percent  = DEFAULT_HP_VOLUME_PERCENT;
+    s_spk_volume_percent = DEFAULT_SPK_VOLUME_PERCENT;
+
+    audio_volume_load_from_nvs();
+
     s_sample_rate = SPK_DEFAULT_RATE;
     s_spk_rate = SPK_DEFAULT_RATE;
+
 
     if (!spk_pool_alloc()) {
         ESP_LOGE(TAG, "SPK pool allocation failed");
@@ -977,6 +1154,8 @@ extern "C" void audio_output_stop(void)
         spk_stream_stop(false);
     }
 
+    audio_volume_flush_to_nvs_locked();
+
     xSemaphoreGive(s_mux);
 }
 
@@ -1049,6 +1228,13 @@ extern "C" void audio_output_poll(void)
     }
 
     uint32_t now = now_ms();
+
+    /*
+     * Сохраняем громкость в NVS с debounce.
+     * Это нужно, потому что энкодер может очень быстро менять значение.
+     */
+    audio_volume_flush_if_due();
+
     if ((now - s_last_poll_ms) < 200) {
         return;
     }
@@ -1091,18 +1277,53 @@ extern "C" void audio_output_set_volume(uint8_t volume_percent)
         volume_percent = 100;
     }
 
-    s_volume_percent = volume_percent;
-
     if (s_mux == nullptr) {
+        /*
+         * До создания мьютекса просто сохраняем значение.
+         * Это маловероятно, но безопасно.
+         */
+        if (s_current_headphone) {
+            if (s_hp_volume_percent != volume_percent) {
+                s_hp_volume_percent = volume_percent;
+                s_hp_vol_dirty = true;
+                s_vol_last_change_us = esp_timer_get_time();
+            }
+        } else {
+            if (s_spk_volume_percent != volume_percent) {
+                s_spk_volume_percent = volume_percent;
+                s_spk_vol_dirty = true;
+                s_vol_last_change_us = esp_timer_get_time();
+            }
+        }
+
         return;
     }
 
     xSemaphoreTake(s_mux, portMAX_DELAY);
 
     if (s_current_headphone) {
+        if (s_hp_volume_percent != volume_percent) {
+            s_hp_volume_percent = volume_percent;
+            audio_volume_mark_changed(true);
+        }
+
         es8388_apply_volume();
+
+        ESP_LOGI(TAG, "HP volume set: %u%%", (unsigned int)volume_percent);
     } else {
-        M5.Speaker.setVolume(speaker_volume_255());
+        if (s_spk_volume_percent != volume_percent) {
+            s_spk_volume_percent = volume_percent;
+            audio_volume_mark_changed(false);
+        }
+
+        if (s_spk_ready) {
+            M5.Speaker.setVolume(speaker_volume_255());
+        }
+
+        ESP_LOGI(TAG,
+                 "SPK volume set: %u%% raw=%u",
+                 (unsigned int)volume_percent,
+                 (unsigned int)speaker_volume_255());
     }
 
     xSemaphoreGive(s_mux);
@@ -1111,4 +1332,30 @@ extern "C" void audio_output_set_volume(uint8_t volume_percent)
 extern "C" bool audio_output_is_headphone(void)
 {
     return s_current_headphone;
+}
+
+extern "C" uint8_t audio_output_get_volume(void)
+{
+    return s_current_headphone ? s_hp_volume_percent : s_spk_volume_percent;
+}
+
+extern "C" uint8_t audio_output_get_headphone_volume(void)
+{
+    return s_hp_volume_percent;
+}
+
+extern "C" uint8_t audio_output_get_speaker_volume(void)
+{
+    return s_spk_volume_percent;
+}
+
+extern "C" void audio_output_save_volumes_now(void)
+{
+    if (s_mux != nullptr) {
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        audio_volume_flush_to_nvs_locked();
+        xSemaphoreGive(s_mux);
+    } else {
+        audio_volume_flush_to_nvs_locked();
+    }
 }
