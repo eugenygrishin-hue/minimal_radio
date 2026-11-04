@@ -14,6 +14,7 @@
 #include <stdlib.h>
 
 #include "config.h"
+#include "cp1251_table.h"
 
 static const char *TAG = "HTTP_STREAM";
 
@@ -31,82 +32,125 @@ static char s_http_last_url[256] = {0};
 
 
 // =====================================================================
-// 1. Улучшенный детектор русского UTF-8 (теперь видит ВСЕ русские буквы)
+// 1. Полный валидатор UTF-8 (любой, не только русский)
 // =====================================================================
-static bool is_valid_utf8_russian(const char* str) {
+static bool is_valid_utf8(const char* str) {
     if (!str) return false;
-    const char* p = str;
-    int russian_chars = 0;
-    int total_high_bytes = 0;
+    const unsigned char* p = (const unsigned char*)str;
 
     while (*p) {
-        unsigned char c = (unsigned char)*p;
-        if (c >= 0xC0) {
-            total_high_bytes++;
-            bool is_russian = false;
+        unsigned char c = *p;
 
-            // Заглавные А-Я: D0 90 - D0 AF
-            if (c == 0xD0 && p[1] >= 0x90 && p[1] <= 0xAF) is_russian = true;
-            // Строчные а-п: D0 B0 - D0 BF (этого не хватало в старой версии!)
-            if (c == 0xD0 && p[1] >= 0xB0 && p[1] <= 0xBF) is_russian = true;
-            // Строчные р-я: D1 80 - D1 8F
-            if (c == 0xD1 && p[1] >= 0x80 && p[1] <= 0x8F) is_russian = true;
-            // Ё: D0 81, ё: D1 91
-            if (c == 0xD0 && p[1] == 0x81) is_russian = true;
-            if (c == 0xD1 && p[1] == 0x91) is_russian = true;
-
-            if (is_russian) {
-                russian_chars++;
-                p += 2; // Пропускаем валидный 2-байтовый символ
-            } else {
-                // Высокий байт, но не русская буква - это не валидный русский UTF-8
-                return false;
-            }
-        } else {
-            p++; // ASCII символы (английские буквы, цифры, пробелы)
+        if (c < 0x80) {            // ASCII
+            p++;
+            continue;
         }
+
+        int extra;
+        uint32_t cp;
+
+        if (c < 0xC2) {            // 0x80..0xC1 — недопустимый lead byte
+            return false;
+        } else if (c < 0xE0) {     // 2-байтовая последовательность
+            extra = 1;
+            cp = c & 0x1F;
+        } else if (c < 0xF0) {     // 3-байтовая
+            extra = 2;
+            cp = c & 0x0F;
+        } else if (c <= 0xF4) {    // 4-байтовая
+            extra = 3;
+            cp = c & 0x07;
+        } else {                   // 0xF5..0xFF — недопустимо
+            return false;
+        }
+
+        for (int i = 1; i <= extra; i++) {
+            p++;
+            if (!*p) return false;                 // обрыв посреди символа
+            unsigned char cc = *p;
+            if ((cc & 0xC0) != 0x80) return false; // не continuation byte
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+
+        // overlong-последовательности
+        if (extra == 1 && cp < 0x80)    return false;
+        if (extra == 2 && cp < 0x800)   return false;
+        if (extra == 3 && cp < 0x10000) return false;
+
+        // суррогаты недопустимы в UTF-8
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        if (cp > 0x10FFFF) return false;
+
+        p++;
     }
 
-    // Если есть высокие байты, но ни одной русской буквы - это не русский UTF-8
-    if (total_high_bytes > 0 && russian_chars == 0) {
-        return false;
-    }
-
-    return true; // Строка либо чистый ASCII, либо валидный русский UTF-8
+    return true;
 }
 
 // =====================================================================
-// 2. Математически точный конвертер CP1251 -> UTF-8
+// 2. Полный конвертер CP1251 -> UTF-8 (по таблице всех 0x80..0xFF)
 // =====================================================================
-static void cp1251_to_utf8(const char* src, char* dst, size_t dst_size) {
+static void cp1251_to_utf8_full(const char* src, char* dst, size_t dst_size) {
+    if (dst_size == 0) return;
     size_t j = 0;
-    for (size_t i = 0; src[i] != '\0' && j < dst_size - 2; i++) {
-        unsigned char c = (unsigned char)src[i];
+    const size_t end = dst_size - 1; // резервируем байт под '\0'
 
-        if (c >= 0xC0 && c <= 0xFF) {
-            if (c == 0xA8) { // Ё
-                if (j + 2 < dst_size) { dst[j++] = 0xD0; dst[j++] = 0x81; }
-            }
-            else if (c == 0xB8) { // ё
-                if (j + 2 < dst_size) { dst[j++] = 0xD1; dst[j++] = 0x91; }
-            }
-            else if (c >= 0xC0 && c <= 0xEF) { // А-п (включая заглавные и часть строчных)
-                if (j + 2 < dst_size) {
-                    dst[j++] = 0xD0;
-                    dst[j++] = c - 0xC0 + 0x90;
-                }
-            }
-            else if (c >= 0xF0 && c <= 0xFF) { // р-я (вторая половина строчных)
-                if (j + 2 < dst_size) {
-                    dst[j++] = 0xD1;
-                    dst[j++] = c - 0xF0 + 0x80;
-                }
-            }
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)src[i];
+        uint32_t cp = (c < 0x80) ? (uint32_t)c
+                                 : (uint32_t)cp1251_to_unicode[c - 0x80];
+
+        // сколько байт нужно для кодирования cp в UTF-8
+        size_t need;
+        if      (cp < 0x80)    need = 1;
+        else if (cp < 0x800)   need = 2;
+        else if (cp < 0x10000) need = 3;
+        else                   need = 4;
+
+        if (j + need > end) break; // не пишем неполный символ на границе буфера
+
+        if (cp < 0x80) {
+            dst[j++] = (char)cp;
+        } else if (cp < 0x800) {
+            dst[j++] = (char)(0xC0 | (cp >> 6));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            dst[j++] = (char)(0xE0 | (cp >> 12));
+            dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
         } else {
-            dst[j++] = c; // ASCII символы копируем как есть
+            dst[j++] = (char)(0xF0 | (cp >> 18));
+            dst[j++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (cp & 0x3F));
         }
     }
+
     dst[j] = '\0';
+}
+
+static const char* skip_utf8_bom(const char* s)
+{
+    if (s == nullptr) {
+        return s;
+    }
+
+    unsigned char b0 = (unsigned char)s[0];
+    if (b0 != 0xEF) {
+        return s;
+    }
+
+    unsigned char b1 = (unsigned char)s[1];
+    if (b1 != 0xBB) {
+        return s;
+    }
+
+    unsigned char b2 = (unsigned char)s[2];
+    if (b2 != 0xBF) {
+        return s;
+    }
+
+    return s + 3;
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
@@ -278,14 +322,13 @@ static void http_read_task(void *pvParameters) {
                                 memcpy(temp_title, t, l);
                                 temp_title[l] = '\0';
 
-                                // УЛУЧШЕННОЕ ОПРЕДЕЛЕНИЕ: проверяем, является ли это валидным UTF-8 с РУССКИМИ буквами
-                                if (!is_valid_utf8_russian(temp_title)) {
-                                    // Это не русский UTF-8, конвертируем из CP1251
-                                    cp1251_to_utf8(temp_title, s_stream_title, sizeof(s_stream_title));
-                                } else {
-                                    // Это валидный русский UTF-8, просто копируем
-                                    strncpy(s_stream_title, temp_title, sizeof(s_stream_title) - 1);
+                                const char* src_title = skip_utf8_bom(temp_title);
+
+                                if (is_valid_utf8(src_title)) {
+                                    strncpy(s_stream_title, src_title, sizeof(s_stream_title) - 1);
                                     s_stream_title[sizeof(s_stream_title) - 1] = '\0';
+                                } else {
+                                    cp1251_to_utf8_full(src_title, s_stream_title, sizeof(s_stream_title));
                                 }
 
                                 ESP_LOGI(TAG, "StreamTitle: %s", s_stream_title);
