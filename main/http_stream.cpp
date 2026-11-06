@@ -16,6 +16,8 @@
 #include "config.h"
 #include "cp1251_table.h"
 
+#include "catalog_manager.h"
+
 static const char *TAG = "HTTP_STREAM";
 
 static RingbufHandle_t s_ringbuf = NULL;
@@ -29,6 +31,13 @@ static SemaphoreHandle_t s_http_mutex = NULL;
 static char s_stream_title[128] = "Connecting...";
 static int s_metaint = 0;
 static char s_http_last_url[256] = {0};
+
+// === ICY metadata from HTTP headers ===
+static char g_station_name[64] = "";
+static int  g_icy_br_kbps = 0;
+static char g_content_type[32] = "";
+
+static uint32_t s_current_station_id = 0;
 
 
 // =====================================================================
@@ -153,11 +162,35 @@ static const char* skip_utf8_bom(const char* s)
     return s + 3;
 }
 
-static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
-    if (evt->event_id == HTTP_EVENT_ON_HEADER &&
-        strcasecmp(evt->header_key, "icy-metaint") == 0) {
-        s_metaint = atoi(evt->header_value);
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_HEADER) {
+        return ESP_OK;
     }
+
+    // КРИТИЧНО: header_key / header_value могут быть NULL
+    if (evt->header_key == NULL || evt->header_value == NULL) {
+        return ESP_OK;
+    }
+
+    if (strcasecmp(evt->header_key, "icy-metaint") == 0) {
+        s_metaint = atoi(evt->header_value);
+        ESP_LOGI(TAG, "ICY metaint: %d", s_metaint);
+    }
+    else if (strcasecmp(evt->header_key, "icy-name") == 0) {
+        strncpy(g_station_name, evt->header_value, sizeof(g_station_name) - 1);
+        g_station_name[sizeof(g_station_name) - 1] = '\0';
+        ESP_LOGI(TAG, "ICY name: %s", g_station_name);
+    }
+    else if (strcasecmp(evt->header_key, "icy-br") == 0) {
+        g_icy_br_kbps = atoi(evt->header_value);
+        ESP_LOGI(TAG, "ICY bitrate: %d kbps", g_icy_br_kbps);
+    }
+    else if (strcasecmp(evt->header_key, "content-type") == 0) {
+        strncpy(g_content_type, evt->header_value, sizeof(g_content_type) - 1);
+        g_content_type[sizeof(g_content_type) - 1] = '\0';
+    }
+
     return ESP_OK;
 }
 
@@ -207,7 +240,7 @@ static void http_read_task(void *pvParameters) {
             config.url = url;
             config.buffer_size = 4096;
             config.crt_bundle_attach = esp_crt_bundle_attach;
-            config.timeout_ms = 1000;
+            config.timeout_ms = 10000;
             // ============================
             config.user_agent = "WinampMPEG/5.0"; // Или "VLC/3.0.0 LibVLC/3.0.0"
             // ============================
@@ -226,6 +259,13 @@ static void http_read_task(void *pvParameters) {
 
             if (esp_http_client_open(client, 0) != ESP_OK) {
                 ESP_LOGW(TAG, "HTTP open failed, retry in %d ms", retry_delay_ms);
+
+
+            if (s_current_station_id > 0) {
+            	catalog_health_on_error(s_current_station_id);
+            }
+
+
                 esp_http_client_cleanup(client);
                 client = NULL;
 
@@ -246,6 +286,11 @@ static void http_read_task(void *pvParameters) {
 
             retry_delay_ms = 1000;
             ESP_LOGI(TAG, "HTTP connected, metaint=%d", s_metaint);
+
+            if (s_current_station_id > 0) {
+                catalog_health_on_stable(s_current_station_id);
+            }
+
         }
 
         if (s_force_stop) break;
@@ -253,6 +298,10 @@ static void http_read_task(void *pvParameters) {
         int read_len = esp_http_client_read(client, (char *)net_buf, 4096);
         if (read_len <= 0) {
             ESP_LOGW(TAG, "HTTP read returned %d, reconnecting in %d ms", read_len, retry_delay_ms);
+
+            if (s_current_station_id > 0) {
+                catalog_health_on_error(s_current_station_id);
+            }
 
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
@@ -451,12 +500,17 @@ void http_stream_stop(void) {
     xSemaphoreGive(s_http_mutex);
 }
 
-void http_stream_start(const char *url) {
+void http_stream_start(const char *url, uint32_t station_id) {
+    s_current_station_id = station_id;
+    // Сброс метаданных при смене станции
+    g_station_name[0] = '\0';
+    g_icy_br_kbps = 0;
+    g_content_type[0] = '\0';
 
-	if (url != nullptr) {
-	    strncpy(s_http_last_url, url, sizeof(s_http_last_url) - 1);
-	    s_http_last_url[sizeof(s_http_last_url) - 1] = '\0';
-	}
+    if (url != nullptr) {
+        strncpy(s_http_last_url, url, sizeof(s_http_last_url) - 1);
+        s_http_last_url[sizeof(s_http_last_url) - 1] = '\0';
+    }
 
     if (s_http_mutex == NULL) return;
 
@@ -493,12 +547,38 @@ uint32_t http_stream_get_ring_fill(void) {
     return used;
 }
 
-void http_stream_restart(void) {
-    if (s_http_last_url[0] == '\0') {
-        ESP_LOGW(TAG, "http_stream_restart: no last URL stored");
-        return;
+void http_stream_drain_ringbuf(void)
+{
+    if (!s_ringbuf) return;
+
+    void* item;
+    size_t size;
+    int drained = 0;
+
+    while ((item = xRingbufferReceive(s_ringbuf, &size, 0)) != NULL) {
+        vRingbufferReturnItem(s_ringbuf, item);
+        drained++;
     }
 
-    ESP_LOGI(TAG, "http_stream_restart: restarting with URL: %s", s_http_last_url);
-    http_stream_start(s_http_last_url);
+    if (drained > 0) {
+        ESP_LOGI(TAG, "Ring buffer drained: %d items discarded", drained);
+    }
+}
+
+void http_stream_restart(void) {
+    http_stream_stop();
+    // Передаем сохраненный ID станции при рестарте
+    http_stream_start(s_http_last_url, s_current_station_id);
+}
+
+const char* http_stream_get_icy_name(void) {
+    return g_station_name;
+}
+
+int http_stream_get_bitrate(void) {
+    return g_icy_br_kbps;
+}
+
+const char* http_stream_get_content_type(void) {
+    return g_content_type;
 }

@@ -6,6 +6,8 @@
 #include "audio_player.h"
 #include "audio_output.h"
 
+#include "font_cyr_8x16.h"
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -56,6 +58,10 @@ static const int WIFI_KB_ACTION_W[4] = {62, 96, 62, 62};
 static const char* WIFI_KB_ACTION_LABEL[4] = {"Shift", "Space", "Del", "OK"};
 
 
+static char s_icy_name[96] = "";
+static int  s_bitrate_kbps = 0;
+static char s_codec[16] = "";
+
 // ============================================================
 // Энкодер: анти-дребезг через накопитель
 // ============================================================
@@ -99,6 +105,8 @@ static uint32_t s_buffer_target = 115 * 1024;
 static uint32_t s_starve_count = 0;
 static uint32_t s_overflow_count = 0;
 
+static int s_switch_phase = 0;
+
 // ============================================================
 // Сетевая телеметрия
 // ============================================================
@@ -133,6 +141,9 @@ static bool s_use_sprite = false;
 
 // Если нужно временно отключить спрайт — поставь true
 static const bool SPRITE_DEBUG_FORCE_DIRECT = false;
+
+
+
 
 // ============================================================
 // Чтение HMI
@@ -215,6 +226,84 @@ static void toggle_mark_station(uint32_t id) {
 
 static void clear_marks() {
     s_marked_count = 0;
+}
+
+// ============================================================
+// Кастомный 8×16 кириллический шрифт (Terminus ter-u16n)
+// ============================================================
+
+static uint16_t s_glyph_rgb[CYR_FONT_W * CYR_FONT_H]; // 128 px = 256 bytes
+
+static uint32_t utf8_decode(const char** pp)
+{
+    const unsigned char* p = (const unsigned char*)(*pp);
+    uint32_t cp;
+    int len;
+
+    if (p[0] < 0x80)                { cp = p[0];           len = 1; }
+    else if ((p[0] & 0xE0) == 0xC0) { cp = p[0] & 0x1F;   len = 2; }
+    else if ((p[0] & 0xF0) == 0xE0) { cp = p[0] & 0x0F;   len = 3; }
+    else if ((p[0] & 0xF8) == 0xF0) { cp = p[0] & 0x07;   len = 4; }
+    else { (*pp)++; return 0xFFFD; }
+
+    for (int i = 1; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) { (*pp)++; return 0xFFFD; }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+
+    *pp += len;
+    return cp;
+}
+
+/**
+ * Рисует строку кастомным шрифтом 8×16 через pushImage().
+ * Фон пикселей глифа = TFT_BLACK.
+ * Возвращает итоговый x (для цепочки сегментов телеметрии).
+ */
+template <typename T>
+static int draw_cyr_str(T& lcd, int x, int y, const char* utf8, uint16_t color)
+{
+    if (!utf8) return x;
+
+    const char* p = utf8;
+
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        int gi = cyr_font_lookup(cp);
+
+        if (gi < 0) {
+            gi = cyr_font_lookup('?');
+        }
+
+        if (gi < 0) {
+            x += CYR_FONT_W;
+            continue;
+        }
+
+        const uint8_t* gdata = cyr_font_data[gi];
+
+        for (int row = 0; row < CYR_FONT_H; row++) {
+            uint8_t bits = gdata[row * CYR_FONT_RB];
+            for (int col = 0; col < CYR_FONT_W; col++) {
+                s_glyph_rgb[row * CYR_FONT_W + col] =
+                    (bits & (0x80 >> col)) ? color : TFT_BLACK;
+            }
+        }
+
+        lcd.pushImage(x, y, CYR_FONT_W, CYR_FONT_H, s_glyph_rgb);
+        x += CYR_FONT_W;
+    }
+
+    return x;
+}
+
+/**
+ * Цветной сегмент телеметрии (замена draw_tele_seg для кастомного шрифта).
+ */
+template <typename T>
+static int draw_cyr_tele_seg(T& lcd, const char* text, uint16_t color, int x, int y)
+{
+    return draw_cyr_str(lcd, x, y, text, color);
 }
 
 // ============================================================
@@ -747,6 +836,237 @@ static void about_row(T& lcd, int y, const char* label, const char* value,
     lcd.drawString(value, 306, y);
     lcd.setTextDatum(TL_DATUM);
 }
+
+// ============================================================
+// PLAY layout constants (320×240)
+// ============================================================
+static constexpr int PLAY_MX       = 10;
+static constexpr int PLAY_W        = 300;
+static constexpr int PLAY_MAX_CH = PLAY_W / CYR_FONT_W; // 300 / 8 = 37
+
+static constexpr int PLAY_Y_CAT    = 48;
+static constexpr int PLAY_Y_STN    = 68;
+static constexpr int PLAY_Y_TRK    = 90;
+static constexpr int PLAY_Y_FLOW   = 150;
+static constexpr int PLAY_Y_TELE   = 196;
+static constexpr int PLAY_Y_HINT   = 216;
+
+static constexpr uint32_t MARQUEE_MS_PER_CHAR = 150;
+static constexpr uint32_t MARQUEE_PAUSE_MS    = 700;
+static constexpr uint32_t FLOW_ANIM_MS        = 120;
+
+// ============================================================
+// Marquee state (per-line)
+// ============================================================
+typedef struct {
+    char     text[128];
+    uint32_t start_ms;
+    bool     active;
+} marquee_state_t;
+
+static marquee_state_t s_mq_station = {"", 0, false};
+static marquee_state_t s_mq_track   = {"", 0, false};
+
+// ============================================================
+// UTF-8 helpers
+// ============================================================
+static int utf8_char_count(const char* s)
+{
+    if (!s) return 0;
+    int count = 0;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) count++;
+        p++;
+    }
+    return count;
+}
+
+static int utf8_char_byte_len(unsigned char lead)
+{
+    if (lead < 0x80) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static int utf8_copy_nth_char(const char* src, int n, char* dst, int dst_sz)
+{
+    if (!src || !dst || dst_sz <= 0) return 0;
+    int idx = 0;
+    const unsigned char* p = (const unsigned char*)src;
+    while (*p) {
+        int blen = utf8_char_byte_len(*p);
+        if (idx == n) {
+            if (blen >= dst_sz) blen = dst_sz - 1;
+            memcpy(dst, p, (size_t)blen);
+            dst[blen] = '\0';
+            return blen;
+        }
+        p += blen;
+        idx++;
+    }
+    return 0;
+}
+
+// ============================================================
+// Временный фикс: й→и, ё→е, Ё→Е, Й→И (для efontCN_14)
+// TODO: удалить после подключения кастомного кириллического шрифта
+// ============================================================
+//static void fix_cyr_temp(char* s)
+//{
+//    if (!s) return;
+//    for (unsigned char* p = (unsigned char*)s; *p; ++p) {
+//        if (p[0] == 0xD0 && p[1] == 0xB9) { p[1] = 0xB8; p++; continue; }
+//        if (p[0] == 0xD0 && p[1] == 0x81) { p[1] = 0x95; p++; continue; }
+//        if (p[0] == 0xD0 && p[1] == 0x99) { p[1] = 0x98; p++; continue; }
+//        if (p[0] == 0xD1 && p[1] == 0x91) { p[0] = 0xD0; p[1] = 0xB5; p++; continue; }
+//    }
+//}
+
+// ============================================================
+// Marquee renderer
+// ============================================================
+template <typename T>
+static void draw_marquee(T& lcd, const char* text, int x, int y,
+                         int max_chars, marquee_state_t& state,
+                         uint32_t now_ms, uint16_t color)
+{
+    if (!text) text = "";
+
+    if (strcmp(text, state.text) != 0) {
+        strlcpy(state.text, text, sizeof(state.text));
+        state.start_ms = now_ms;
+    }
+
+    int total = utf8_char_count(text);
+    lcd.setTextColor(color);
+
+    if (total <= max_chars) {
+        char buf[128];
+        strlcpy(buf, text, sizeof(buf));
+
+        draw_cyr_str(lcd, x, y, buf, color);
+
+        state.active = false;
+        return;
+    }
+
+    state.active = true;
+    const int gap = 4;
+    int cycle = total + gap;
+
+    uint32_t elapsed = now_ms - state.start_ms;
+
+    if (elapsed < MARQUEE_PAUSE_MS) {
+        char buf[128];
+        int out = 0;
+        for (int i = 0; i < max_chars && i < total; i++) {
+            out += utf8_copy_nth_char(text, i, buf + out, (int)sizeof(buf) - out);
+        }
+        buf[out] = '\0';
+
+        draw_cyr_str(lcd, x, y, buf, color);
+
+        return;
+    }
+
+    int offset = (int)(((elapsed - MARQUEE_PAUSE_MS) / MARQUEE_MS_PER_CHAR) % (uint32_t)cycle);
+
+    char buf[160];
+    int out = 0;
+    for (int i = 0; i < max_chars; i++) {
+        int idx = (offset + i) % cycle;
+        if (idx < total) {
+            out += utf8_copy_nth_char(text, idx, buf + out, (int)sizeof(buf) - out);
+        } else {
+            buf[out++] = ' ';
+        }
+    }
+    buf[out] = '\0';
+
+    draw_cyr_str(lcd, x, y, buf, color);
+}
+
+// ============================================================
+// Flow-bar renderer
+// ============================================================
+template <typename T>
+static void draw_flow_bar(T& lcd, int x, int y, int w, int h,
+                          int net_pct, int bitrate_kbps,
+                          bool starve_recent, bool overflow_recent,
+                          uint32_t now_ms)
+{
+    // Фон полосы
+    lcd.fillRoundRect(x, y, w, h, 3, TFT_BLACK);
+    lcd.drawRoundRect(x, y, w, h, 3, TFT_DARKGREY);
+
+    // Заполнение по уровню buffer/net
+    int fill_w = (w * net_pct) / 100;
+    if (fill_w < 0) fill_w = 0;
+    if (fill_w > w) fill_w = w;
+
+    uint16_t fill_color;
+    if (net_pct == 0) {
+        fill_color = TFT_RED;
+    } else if (net_pct < 10) {
+        fill_color = 0xFFE0; // жёлтый
+    } else {
+        fill_color = 0x07E0; // зелёный
+    }
+
+    if (fill_w > 0) {
+        lcd.fillRoundRect(x, y, fill_w, h, 3, fill_color);
+    }
+
+    // Бегущий маркер активности
+    if (net_pct > 0) {
+        int marker_w = 14;
+        int travel = w - marker_w;
+        if (travel < 1) travel = 1;
+
+        // Скорость маркера зависит от заявленного битрейта станции.
+        // Если битрейт неизвестен — едет медленно.
+        int px_per_sec = bitrate_kbps > 0 ? (bitrate_kbps * 8) : 10;
+
+        if (px_per_sec > 300) px_per_sec = 300;
+        if (px_per_sec < 20)  px_per_sec = 20;
+
+        int marker_pos = (int)(
+            ((uint64_t)now_ms * (uint64_t)px_per_sec / 1000ULL)
+            % (uint32_t)travel
+        );
+
+        int mx = x + marker_pos;
+
+        uint16_t marker_color = TFT_WHITE;
+
+        if (starve_recent) {
+            marker_color = TFT_RED;
+        } else if (overflow_recent) {
+            marker_color = 0xFFE0;
+        }
+
+        lcd.fillRoundRect(mx, y + 3, marker_w, h - 6, 2, marker_color);
+    }
+
+    // Мигающая рамка при starve
+    if (starve_recent && ((now_ms / 300) % 2 == 0)) {
+        lcd.drawRoundRect(x, y, w, h, 3, TFT_RED);
+    }
+}
+
+// ============================================================
+// Цветной сегмент телеметрии
+// ============================================================
+template <typename T>
+static int draw_tele_seg(T& lcd, const char* text, uint16_t color, int x, int y)
+{
+    lcd.setTextColor(color);
+    lcd.drawString(text, x, y);
+    return utf8_char_count(text) * 8;
+}
 // ============================================================
 // Отрисовка UI (template)
 // ============================================================
@@ -795,9 +1115,6 @@ static void draw_ui_impl(T& lcd) {
         lcd.setTextDatum(TL_DATUM);
     }
 
-    // ========================================================
-    // Wi-Fi Settings
-    // ========================================================
     // ========================================================
     // Wi-Fi Settings & Known Networks
     // ========================================================
@@ -989,12 +1306,26 @@ static void draw_ui_impl(T& lcd) {
                 int global_idx = catalog_get_favorite_global_index(i);
                 const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
                 if (st == nullptr) continue; // Станция могла быть удалена из каталога
+                // --- Обработка статуса для избранного ---
+                char fav_display_name[128];
+                uint16_t base_color = TFT_WHITE;
+                const char* suffix = "";
 
+                if (st->status == CAT_STATUS_SUSPECT) {
+                    suffix = " [?]";
+                    base_color = 0xFFE0; // Желтый
+                } else if (st->status == CAT_STATUS_DEAD) {
+                    suffix = " [X]";
+                    base_color = 0x8430; // Темно-красный/серый
+                }
+
+                snprintf(fav_display_name, sizeof(fav_display_name), "%s%s", st->name, suffix);
+                // ----------------------------------------
                 if (i == s_fav_station_idx) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
                 } else {
-                    lcd.setTextColor(TFT_WHITE);
+                    lcd.setTextColor(base_color);
                 }
                 lcd.setFont(&fonts::efontCN_16);
                 lcd.drawString(st->name, 15, y);
@@ -1125,66 +1456,139 @@ static void draw_ui_impl(T& lcd) {
     // ========================================================
     // Catalog Management (Финальная версия с прогресс-баром)
     // ========================================================
+
     else if (s_current_mode == MODE_CATALOG) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
         lcd.drawString("Управление каталогом", 10, 48);
 
-        // Если идет валидация, показываем прогресс-бар вместо меню
-        if (catalog_is_validating()) {
-            int done = catalog_get_validated_count();
-            int total = catalog_get_staging_count();
-            int pct = (total > 0) ? (done * 100 / total) : 0;
+        // 1. Если идет слияние (Merge), показываем прогресс
+        if (catalog_is_merging()) {
+            catalog_merge_phase_t phase = catalog_get_merge_phase();
+            int pct = catalog_get_merge_progress();
 
+            static uint32_t last_log_ms = 0;
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+            if (now_ms - last_log_ms > 1000) {
+                last_log_ms = now_ms;
+                ESP_LOGI("UI_DRAW", "Merge draw active, pct=%d", pct);
+            }
+
+            const char* msg = "Слияние каталога...";
+
+            if (phase == CATALOG_MERGE_PHASE_SAVE) {
+                msg = "Сохранение каталога на SD...";
+            } else if (phase == CATALOG_MERGE_PHASE_DONE) {
+                msg = "Завершение...";
+            }
+
+            lcd.setFont(&fonts::efontCN_14);
             lcd.setTextColor(TFT_WHITE);
-            lcd.drawString("Проверка живых станций...", 15, 80);
+            lcd.drawString(msg, 15, 80);
 
             lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+
             int bar_w = (290 * pct) / 100;
             if (bar_w > 0) {
                 lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
             }
 
             char buf[48];
-            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+            snprintf(buf, sizeof(buf), "%d%%", pct);
+
             lcd.setTextDatum(MC_DATUM);
-            lcd.setTextColor(TFT_WHITE); // Белый текст для читаемости
+            lcd.setTextColor(TFT_WHITE);
             lcd.drawString(buf, 160, 122);
             lcd.setTextDatum(TL_DATUM);
 
             lcd.setTextColor(TFT_LIGHTGRAY);
-            lcd.drawString("Можно слушать радио...", 15, 150);
-            return; // Выходим, не рисуем меню поверх
+            lcd.drawString("Радио продолжает играть...", 15, 150);
+
+            return;
         }
 
-        // Обычное меню (когда валидация не идет)
+        // 2. Если идет глубокая валидация
+        if (catalog_is_deep_validating()) {
+            int done = catalog_get_deep_validated_count();
+            int total = catalog_get_suspect_count() + done;
+            if (total == 0) total = 1;
+            int pct = (done * 100) / total;
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString("Глубокая проверка SUSPECT...", 15, 80);
+            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+            int bar_w = (290 * pct) / 100;
+            if (bar_w > 0) {
+                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+            }
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+            lcd.setTextDatum(MC_DATUM);
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString(buf, 160, 122);
+            lcd.setTextDatum(TL_DATUM);
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.drawString("Можно слушать радио...", 15, 150);
+            return;
+        }
+
+        // 3. Если идет обычная валидация
+        if (catalog_is_validating()) {
+            int done = catalog_get_validated_count();
+            int total = catalog_get_staging_count();
+            int pct = (total > 0) ? (done * 100 / total) : 0;
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString("Проверка живых станций...", 15, 80);
+            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+            int bar_w = (290 * pct) / 100;
+            if (bar_w > 0) {
+                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+            }
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+            lcd.setTextDatum(MC_DATUM);
+            lcd.setTextColor(TFT_WHITE);
+            lcd.drawString(buf, 160, 122);
+            lcd.setTextDatum(TL_DATUM);
+            lcd.setTextColor(TFT_LIGHTGRAY);
+            lcd.drawString("Можно слушать радио...", 15, 150);
+            return;
+        }
+
+        // 4. Обычное меню (строго синхронизировано с обработчиком ниже!)
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(TFT_WHITE);
 
-        int staging_count = catalog_staging_get_count();
-        char line[64];
-        snprintf(line, sizeof(line), "В буфере: %d станций", staging_count);
-        lcd.drawString(line, 15, 76);
+        int staging_count = catalog_get_staging_count();
+        int alive_count = catalog_get_alive_count();
+        int suspect_count = catalog_get_suspect_count();
+        int dead_count = catalog_get_dead_count();
 
-        int y = 100;
+        char line[96];
+        snprintf(line, sizeof(line), "В буфере: %d (A:%d S:%d D:%d)",
+                 staging_count, alive_count, suspect_count, dead_count);
+        lcd.drawString(line, 15, 68); // Подняли выше
+
+        int y = 88; // Подняли начало меню
         const char* items[] = {
-            "1. Загрузить РАБОЧИЙ каталог",
-            "2. Импортировать M3U с SD",
-            "3. Проверить живые (Validate)",
-            "4. Применить изменения (Merge)",
-            "5. Назад"
+            "1. Импортировать M3U с SD",          // index 0
+            "2. Проверить живые (Fast)",          // index 1
+            "3. Глубоко проверить SUSPECT",       // index 2
+            "4. Применить изменения (Merge)",     // index 3
+            "5. Зачистить мертвые станции",       // index 4
+            "6. Назад"                            // index 5
         };
-        int count = 5;
+        int count = 6;
 
         for (int i = 0; i < count; i++) {
             if (i == s_settings_idx) {
                 lcd.setTextColor(TFT_BLACK);
-                lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                lcd.fillRoundRect(5, y - 4, 310, 24, 4, 0x07E0);
             } else {
                 lcd.setTextColor(TFT_WHITE);
             }
             lcd.drawString(items[i], 15, y);
-            y += 32;
+            y += 24;
         }
     }
 
@@ -1192,98 +1596,225 @@ static void draw_ui_impl(T& lcd) {
     // Playback
     // ========================================================
     if (s_current_mode == MODE_PLAYBACK) {
-        lcd.setFont(&fonts::efontCN_14);
-        lcd.setTextColor(0x07E0);
-        const catalog_category_t* play_cat = catalog_get_category(s_selected_category);
-        lcd.drawString(play_cat ? play_cat->name : "---", 10, 48);
 
-        lcd.setFont(&fonts::efontCN_16);
-        lcd.setTextColor(TFT_WHITE);
-        lcd.drawString(s_station_name, 10, 68);
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        lcd.setFont(&fonts::efontCN_14);
-        lcd.setTextColor(TFT_LIGHTGRAY);
-        lcd.drawString(s_track_title, 10, 98);
+        //lcd.setFont(&fonts::efontCN_14);
 
-        lcd.setFont(&fonts::Font0);
-        lcd.setTextColor(0x07E0);
-        lcd.drawString("Buffer:", 10, 128);
+        // ---- 1. Категория (слева) + Badge bitrate/codec (справа) ----
+        {
+            const catalog_category_t* cat = catalog_get_category(s_selected_category);
+            const char* cat_name = cat ? cat->name : "-";
 
-        int bar_w = 280;
-        int bar_h = 16;
-        lcd.drawRoundRect(10, 146, bar_w, bar_h, 4, TFT_WHITE);
-        int fill_pct = 0;
-        if (s_buffer_target > 0) {
-            fill_pct = (int)((s_buffer_level * 100) / s_buffer_target);
-        }
-        if (fill_pct > 100) fill_pct = 100;
-        int fill_w = (fill_pct * bar_w) / 100;
-        if (fill_w > 0) {
-            lcd.fillRoundRect(10, 146, fill_w, bar_h, 4, 0x07E0);
-        }
-
-        char buf[48];
-        lcd.setTextColor(TFT_WHITE);
-        snprintf(buf, sizeof(buf), "Buf: %d%% (%lu KB)",
-                 fill_pct,
-                 (unsigned long)(s_buffer_level / 1024));
-        lcd.drawString(buf, 10, 168);
-
-        // ========================================================
-        // Если идет валидация — показываем прогресс-бар вместо Net/sparkline
-        // ========================================================
-        if (catalog_is_validating()) {
-            int done = catalog_get_validated_count();
-            int total = catalog_get_staging_count();
-            int pct = (total > 0) ? (done * 100 / total) : 0;
-
-            lcd.setFont(&fonts::Font0);
-            lcd.setTextColor(0x07E0);
-            lcd.drawString("Validate:", 10, 186);
-
-            // Рамка прогресс-бара (та же геометрия, что и у Buffer)
-            lcd.drawRoundRect(10, 198, 280, 16, 4, TFT_DARKGREY);
-            int vbar_w = (280 * pct) / 100;
-            if (vbar_w > 0) {
-                lcd.fillRoundRect(10, 198, vbar_w, 16, 4, 0x07E0);
+            char badge[40] = "";
+            if (s_bitrate_kbps > 0 && s_codec[0]) {
+                snprintf(badge, sizeof(badge), "%dk %s", s_bitrate_kbps, s_codec);
+            } else if (s_bitrate_kbps > 0) {
+                snprintf(badge, sizeof(badge), "%dk", s_bitrate_kbps);
+            } else if (s_codec[0]) {
+                strlcpy(badge, s_codec, sizeof(badge));
             }
 
-            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString(buf, 10, 218);
+            int badge_chars = utf8_char_count(badge);
+            int cat_max = PLAY_MAX_CH - badge_chars - 2;
+            if (cat_max < 6) cat_max = 6;
 
-        } else {
-            // ========================================================
-            // Обычная сетевая телеметрия
-            // ========================================================
-            int net_pct = 0;
-            if (s_net_capacity > 0) {
-                net_pct = (int)((s_net_fill * 100) / s_net_capacity);
-            }
-            if (net_pct > 100) net_pct = 100;
-
-            if (net_pct == 0) {
-                lcd.setTextColor(TFT_RED);
-            } else if (net_pct < 10) {
-                lcd.setTextColor(TFT_YELLOW);
+            //lcd.setTextColor(TFT_LIGHTGRAY);
+            char cat_buf[64];
+            int cat_len = utf8_char_count(cat_name);
+            if (cat_len <= cat_max) {
+                strlcpy(cat_buf, cat_name, sizeof(cat_buf));
             } else {
-                lcd.setTextColor(0x07E0);
+                int out = 0;
+                for (int i = 0; i < cat_max - 3 && i < cat_len; i++) {
+                    out += utf8_copy_nth_char(cat_name, i, cat_buf + out, (int)sizeof(cat_buf) - out);
+                }
+                cat_buf[out++] = '.';
+                cat_buf[out++] = '.';
+                cat_buf[out++] = '.';
+                cat_buf[out] = '\0';
+            }
+            //fix_cyr_temp(cat_buf);
+            //lcd.drawString(cat_buf, PLAY_MX, PLAY_Y_CAT);
+            draw_cyr_str(lcd, PLAY_MX, PLAY_Y_CAT, cat_buf, TFT_LIGHTGRAY);
+
+            //if (badge[0]) {
+            //    lcd.setTextColor(0x07E0);
+            //    lcd.setTextDatum(TR_DATUM);
+            //    lcd.drawString(badge, 320 - PLAY_MX, PLAY_Y_CAT);
+            //    lcd.setTextDatum(TL_DATUM);
+            //}
+
+            if (badge[0]) {
+                int bw = (int)strlen(badge) * CYR_FONT_W;
+                draw_cyr_str(lcd, 320 - PLAY_MX - bw, PLAY_Y_CAT, badge, 0x07E0);
+            }
+        }
+
+        // ---- 2. Название станции ----
+        if (s_switch_phase != 0) {
+            const char* switch_msg;
+
+            if (s_switch_phase == 1) {
+                switch_msg = "Затухание...";          // FADING_OUT (120 мс)
+            } else if (s_switch_phase >= 2 && s_switch_phase <= 4) {
+                switch_msg = "Подключение...";        // DRAINING + STARTING + WAITING_DATA
+            } else {
+                switch_msg = "Воспроизведение...";    // FADING_IN (120 мс)
             }
 
-            snprintf(buf, sizeof(buf), "Net: %d%% (%lu KB)",
-                     net_pct,
-                     (unsigned long)(s_net_fill / 1024));
-            lcd.drawString(buf, 10, 186);
+            draw_cyr_str(lcd, PLAY_MX, PLAY_Y_STN, switch_msg, TFT_YELLOW);
+        } else {
+            const char* base = s_station_name;
+            if (s_icy_name[0] != '\0') {
+                base = s_icy_name;
+            }
 
-            // Мини-график сетевого буфера
-            draw_net_sparkline_impl(lcd, 10, 204, 300, 18);
+            char stn_line[128];
+            uint16_t stn_color = TFT_WHITE;
 
-            lcd.setTextColor(TFT_RED);
-            snprintf(buf, sizeof(buf), "Starve: %lu | Overflow: %lu",
-                     (unsigned long)s_starve_count,
-                     (unsigned long)s_overflow_count);
-            lcd.drawString(buf, 10, 226);
+            if (strstr(s_station_name, " [?]") != nullptr) {
+                snprintf(stn_line, sizeof(stn_line), "%s [?]", base);
+                stn_color = 0xFFE0;
+            } else if (strstr(s_station_name, " [X]") != nullptr) {
+                snprintf(stn_line, sizeof(stn_line), "%s [X]", base);
+                stn_color = 0x8430;
+            } else {
+                strlcpy(stn_line, base, sizeof(stn_line));
+            }
+
+            draw_marquee(lcd, stn_line, PLAY_MX, PLAY_Y_STN,
+                         PLAY_MAX_CH, s_mq_station, now_ms, stn_color);
         }
+
+
+
+        // ---- 3. StreamTitle (бегущая строка) ----
+
+        {
+            if (s_switch_phase != 0) {
+                draw_cyr_str(lcd, PLAY_MX, PLAY_Y_TRK, "...", TFT_GREEN);
+            } else {
+                {
+                    const char* trk = s_track_title;
+                    if (!trk || !trk[0]) trk = "...";
+
+                    draw_marquee(lcd, trk, PLAY_MX, PLAY_Y_TRK,
+                                 PLAY_MAX_CH, s_mq_track, now_ms, TFT_GREEN);
+                }
+            }
+        }
+
+
+        // ================================================================
+        // 4. Flow-bar
+        // ================================================================
+        {
+            int net_pct = 0;
+            if (s_buffer_target > 0) {
+                net_pct = (int)((s_buffer_level * 100) / s_buffer_target);
+                if (net_pct > 100) net_pct = 100;
+            }
+
+            bool starve_recent   = (s_starve_count > 0);
+            bool overflow_recent = (s_overflow_count > 0);
+
+            if (catalog_is_validating()) {
+                int done  = catalog_get_validated_count();
+                int total = catalog_get_staging_count();
+                int pct   = (total > 0) ? (done * 100 / total) : 0;
+
+                lcd.fillRoundRect(PLAY_MX, PLAY_Y_FLOW, PLAY_W, 16, 3, TFT_BLACK);
+                lcd.drawRoundRect(PLAY_MX, PLAY_Y_FLOW, PLAY_W, 16, 3, TFT_DARKGREY);
+
+                int vw = (PLAY_W * pct) / 100;
+                if (vw > 0) {
+                    lcd.fillRoundRect(PLAY_MX, PLAY_Y_FLOW, vw, 16, 3, 0x07E0);
+                }
+
+                char vbuf[48];
+                snprintf(vbuf, sizeof(vbuf), "Val %d/%d (%d%%)", done, total, pct);
+
+                //lcd.setTextColor(TFT_WHITE);
+                //lcd.setTextDatum(MC_DATUM);
+                //lcd.drawString(vbuf, PLAY_MX + PLAY_W / 2, PLAY_Y_FLOW + 8);
+                //lcd.setTextDatum(TL_DATUM);
+
+                {
+                    int vw = (int)strlen(vbuf) * CYR_FONT_W;
+                    draw_cyr_str(lcd, PLAY_MX + (PLAY_W - vw) / 2, PLAY_Y_FLOW + 1, vbuf, TFT_WHITE);
+                }
+
+            } else {
+                draw_flow_bar(lcd,
+                              PLAY_MX,
+                              PLAY_Y_FLOW,
+                              PLAY_W,
+                              16,
+                              net_pct,
+                              s_bitrate_kbps,
+                              starve_recent,
+                              overflow_recent,
+                              now_ms);
+            }
+        }
+
+        // ---- 5. Телеметрия: Buf / Net / OVR / STR (цветная, одна строка) ----
+        {
+            int buf_pct = 0;
+            if (s_buffer_target > 0) {
+                buf_pct = (int)((s_buffer_level * 100) / s_buffer_target);
+                if (buf_pct > 100) buf_pct = 100;
+            }
+            int buf_kb  = (int)(s_buffer_level / 1024);
+            int net_pct = buf_pct;
+
+            uint16_t buf_color;
+            if (buf_pct >= 60)      buf_color = 0x07E0;
+            else if (buf_pct >= 30) buf_color = 0xFFE0;
+            else                    buf_color = TFT_RED;
+
+            uint16_t net_color;
+            if (net_pct == 0)       net_color = TFT_RED;
+            else if (net_pct < 10)  net_color = 0xFFE0;
+            else                    net_color = 0x07E0;
+
+            uint16_t ovr_color = (s_overflow_count > 0) ? TFT_RED : TFT_DARKGREY;
+            uint16_t str_color = (s_starve_count  > 0) ? TFT_RED : TFT_DARKGREY;
+
+            char ovr_str[8], str_str[8];
+            if (s_overflow_count > 99) strlcpy(ovr_str, "99+", sizeof(ovr_str));
+            else snprintf(ovr_str, sizeof(ovr_str), "%lu", (unsigned long)s_overflow_count);
+            if (s_starve_count > 99) strlcpy(str_str, "99+", sizeof(str_str));
+            else snprintf(str_str, sizeof(str_str), "%lu", (unsigned long)s_starve_count);
+
+            char buf_pct_str[16], buf_kb_str[16], net_pct_str[16];
+            snprintf(buf_pct_str, sizeof(buf_pct_str), "%d%%", buf_pct);
+            snprintf(buf_kb_str,  sizeof(buf_kb_str),  "%dK",  buf_kb);
+            snprintf(net_pct_str, sizeof(net_pct_str), "%d%%", net_pct);
+
+            int tx = PLAY_MX;
+            tx += draw_cyr_tele_seg(lcd, "Buf ",  TFT_LIGHTGRAY, tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, buf_pct_str, buf_color,  tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, " ",     TFT_LIGHTGRAY, tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, buf_kb_str,  TFT_LIGHTGRAY, tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, " | ",   TFT_DARKGREY,  tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, "Net ", TFT_LIGHTGRAY, tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, net_pct_str, net_color, tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, " | ",  TFT_DARKGREY,  tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, "O:",   ovr_color,     tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, ovr_str, ovr_color,    tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, " S:",  str_color,     tx, PLAY_Y_TELE);
+            tx += draw_cyr_tele_seg(lcd, str_str, str_color,    tx, PLAY_Y_TELE);
+        }
+
+        // ---- 6. Подсказки ----
+        //lcd.setTextColor(TFT_DARKGREY);
+        //lcd.drawString("A:Play  B:Mode  Enc:Vol", PLAY_MX, PLAY_Y_HINT);
+
+        draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT, "A:Play  B:Mode  Enc:Vol", TFT_DARKGREY);
+
+        return;
     }
 
     // ========================================================
@@ -1303,7 +1834,7 @@ static void draw_ui_impl(T& lcd) {
         }
 
         int visible_items = 5;
-        int cat_count = (int)catalog_category_count();
+        int cat_count = (int)catalog_category_count(); // <-- ПРАВИЛЬНАЯ ПЕРЕМЕННАЯ
         int total_items = cat_count + 1; // +1 для служебного пункта
 
         int start_idx = s_selected_category;
@@ -1311,6 +1842,8 @@ static void draw_ui_impl(T& lcd) {
         if (start_idx < 0) start_idx = 0;
 
         int y = 68;
+
+        // <-- ПРАВИЛЬНЫЙ ЦИКЛ ДЛЯ КАТЕГОРИЙ -->
         for (int i = start_idx; i < total_items && i < start_idx + visible_items; i++) {
             if (i < cat_count) {
                 // ---- Обычная категория ----
@@ -1366,7 +1899,6 @@ static void draw_ui_impl(T& lcd) {
         lcd.setFont(&fonts::efontCN_14);
         lcd.setTextColor(0x07E0);
 
-        // Заголовок: в режиме выделения показываем счётчик
         if (s_selection_mode) {
             char title[80];
             snprintf(title, sizeof(title), "%s [ВЫДЕЛЕНИЕ: %d]",
@@ -1378,77 +1910,106 @@ static void draw_ui_impl(T& lcd) {
 
         int visible_items = 6;
         int station_count = cur_cat ? (int)cur_cat->count : 0;
-        int total_items = station_count + 1; // +1 для служебного пункта
 
-        int start_idx = s_ui_station_idx;
-        if (start_idx > 3) {
-            start_idx = s_ui_station_idx - 3;
+        // 1. Находим "якорь" для отрисовки.
+        // Идем назад от выбранного элемента, чтобы он гарантированно попал в окно из visible_items элементов.
+        int start_draw_idx = s_ui_station_idx;
+        int valid_count = 0;
+
+        while (start_draw_idx > 0) {
+            int check_idx = start_draw_idx - 1;
+            bool is_valid = false;
+
+            if (check_idx < station_count) {
+                const catalog_station_t* st = catalog_get_station(s_selected_category, check_idx);
+                if (st != nullptr && st->status != CAT_STATUS_DEAD) {
+                    is_valid = true;
+                }
+            } else if (check_idx == station_count) {
+                is_valid = true; // Служебная строка ВСЕГДА считается валидным элементом для отрисовки
+            }
+
+            if (is_valid) {
+                valid_count++;
+                if (valid_count >= visible_items) {
+                    break;
+                }
+            }
+            start_draw_idx = check_idx;
         }
+
         int y = 68;
+        int visible_drawn = 0;
+        int current_raw_idx = start_draw_idx;
 
-        for (int i = start_idx; i < total_items && i < start_idx + visible_items; i++) {
-            if (i < station_count) {
-                // ---- Обычная станция ----
-                const catalog_station_t* st = catalog_get_station(s_selected_category, i);
-                if (st == nullptr) continue;
+        // 2. Рисуем элементы, пока не заполним экран или не кончится список
+        while (visible_drawn < visible_items && current_raw_idx <= station_count) {
 
-                bool is_fav = catalog_is_favorite(st->id);
-                bool is_marked = is_station_marked(st->id);
-
-                if (i == s_ui_station_idx) {
-                    lcd.setTextColor(TFT_BLACK);
-                    lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
-                } else {
-                    if (is_marked) {
-                        lcd.setTextColor(TFT_RED); // Отмеченные — красные
-                    } else {
-                        lcd.setTextColor(TFT_WHITE);
-                    }
-                }
-
-                lcd.setFont(&fonts::efontCN_16);
-
-                char display_name[CATALOG_MAX_NAME_LEN + 16];
-                if (s_selection_mode) {
-                    // В режиме выделения показываем чекбоксы
-                    if (is_marked) {
-                        snprintf(display_name, sizeof(display_name), "[x] %s", st->name);
-                    } else {
-                        snprintf(display_name, sizeof(display_name), "[ ] %s", st->name);
-                    }
-                } else {
-                    // В обычном режиме показываем звёздочку для избранных
-                    if (is_fav) {
-                        snprintf(display_name, sizeof(display_name), "★ %s", st->name);
-                    } else {
-                        snprintf(display_name, sizeof(display_name), "  %s", st->name);
-                    }
-                }
-
-                lcd.drawString(display_name, 15, y);
-            } else {
-                // ---- Служебный пункт ----
-                if (i == s_ui_station_idx) {
+            // Служебный пункт
+            if (current_raw_idx == station_count) {
+                bool is_service_selected = (s_ui_station_idx == station_count);
+                if (is_service_selected) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
                 } else {
                     lcd.setTextColor(TFT_YELLOW);
                 }
-
                 lcd.setFont(&fonts::efontCN_14);
                 char label[64];
                 if (s_selection_mode) {
-                    if (s_marked_count > 0) {
-                        snprintf(label, sizeof(label), "Удалить отмеченные (%d)", (int)s_marked_count);
-                    } else {
-                        snprintf(label, sizeof(label), "Выход из режима выделения");
-                    }
+                    if (s_marked_count > 0) snprintf(label, sizeof(label), "Удалить отмеченные (%d)", (int)s_marked_count);
+                    else snprintf(label, sizeof(label), "Выход из режима выделения");
                 } else {
                     snprintf(label, sizeof(label), ">> Режим выделения");
                 }
                 lcd.drawString(label, 15, y);
+                y += 28;
+                visible_drawn++;
+                current_raw_idx++;
+                continue;
             }
+
+            // Обычная станция
+            const catalog_station_t* st = catalog_get_station(s_selected_category, current_raw_idx);
+            current_raw_idx++; // Сразу двигаем индекс для следующей итерации
+
+            if (st == nullptr || st->status == CAT_STATUS_DEAD) {
+                continue; // Пропускаем мертвые, не увеличивая visible_drawn и y
+            }
+
+            bool is_fav = catalog_is_favorite(st->id);
+            bool is_marked = is_station_marked(st->id);
+
+            const char* status_suffix = "";
+            uint16_t base_color = TFT_WHITE;
+
+            if (st->status == CAT_STATUS_SUSPECT) {
+                status_suffix = " [?]";
+                base_color = 0xFFE0;
+            } else if (is_marked) {
+                base_color = 0xF800;
+            }
+
+            char final_name[128];
+            if (s_selection_mode) {
+                snprintf(final_name, sizeof(final_name), "%s %s%s", is_marked ? "[x]" : "[ ]", st->name, status_suffix);
+            } else {
+                snprintf(final_name, sizeof(final_name), "%s %s%s", is_fav ? "★" : " ", st->name, status_suffix);
+            }
+
+            // Подсветка: current_raw_idx уже инкрементирован, поэтому вычитаем 1
+            if ((current_raw_idx - 1) == s_ui_station_idx) {
+                lcd.setTextColor(TFT_BLACK);
+                lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
+            } else {
+                lcd.setTextColor(base_color);
+            }
+
+            lcd.setFont(&fonts::efontCN_16);
+            lcd.drawString(final_name, 15, y);
+
             y += 28;
+            visible_drawn++;
         }
     }
 
@@ -1620,6 +2181,26 @@ void ui_update() {
         return;
     }
 
+    if (catalog_is_merging()) {
+        last_btn_a = btn_a;
+        last_btn_b = btn_b;
+        enc_is_pressed = btn_enc;
+
+        // Принудительно перерисовываем UI во время merge,
+        // но не слишком часто, чтобы не грузить SPI-дисплей.
+        static uint32_t s_last_merge_draw_ms = 0;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (s_last_merge_draw_ms == 0 ||
+            (now_ms - s_last_merge_draw_ms) >= 80) {
+
+            s_last_merge_draw_ms = now_ms;
+            draw_ui();
+        }
+
+        return;
+    }
+
     // ========================================================
     // 3. Мигание курсора
     // ========================================================
@@ -1634,6 +2215,17 @@ void ui_update() {
     if (redraw_counter >= 10) {
         ui_needs_redraw = true;
         redraw_counter = 0;
+    }
+
+    // PLAY-режим: принудительная перерисовка для marquee + flow-bar
+    if (s_current_mode == MODE_PLAYBACK && s_display_awake) {
+        static uint32_t s_last_play_anim_ms = 0;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (now_ms - s_last_play_anim_ms >= FLOW_ANIM_MS) {
+            s_last_play_anim_ms = now_ms;
+            ui_needs_redraw = true;
+        }
     }
 
     // ========================================================
@@ -1682,13 +2274,37 @@ void ui_update() {
             else if (s_current_mode == MODE_STATIONS) {
                 const catalog_category_t* ec = catalog_get_category(s_selected_category);
                 int station_count = ec ? (int)ec->count : 0;
-                int total_items = station_count + 1; // +1 для служебного пункта
 
-                s_ui_station_idx += effective;
-                if (s_ui_station_idx < 0) s_ui_station_idx = 0;
-                if (total_items > 0 && s_ui_station_idx >= total_items) {
-                    s_ui_station_idx = total_items - 1;
+                int direction = (effective > 0) ? 1 : -1;
+                int steps = (effective > 0) ? effective : -effective;
+
+                int target_idx = s_ui_station_idx;
+
+                for (int step = 0; step < steps; step++) {
+                    target_idx += direction;
+
+                    // Границы списка
+                    if (target_idx > station_count) {
+                        target_idx = station_count;
+                        break;
+                    }
+                    if (target_idx < 0) {
+                        target_idx = 0;
+                        break;
+                    }
+
+                    // Если станция мертва, мы НЕ засчитываем этот шаг (step--),
+                    // но продолжаем цикл, чтобы проверить следующий индекс в том же направлении.
+                    const catalog_station_t* next_st = catalog_get_station(s_selected_category, target_idx);
+                    if (next_st != nullptr && next_st->status == CAT_STATUS_DEAD) {
+                        step--;
+                        continue;
+                    }
+
+                    // Нашли живую станцию (или служебный пункт) - фиксируем переход
+                    s_ui_station_idx = target_idx;
                 }
+
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_FAVORITES) {
@@ -1707,7 +2323,7 @@ void ui_update() {
                 s_settings_idx += effective;
                 if (s_settings_idx < 0) s_settings_idx = 0;
                 if (s_current_mode == MODE_SETTINGS && s_settings_idx >= 4) s_settings_idx = 3;
-                if (s_current_mode == MODE_CATALOG && s_settings_idx >= 5) s_settings_idx = 4; // <-- Важно!
+                if (s_current_mode == MODE_CATALOG && s_settings_idx >= 6) s_settings_idx = 5; // <-- ИЗМЕНЕНО
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
@@ -1995,6 +2611,14 @@ void ui_update() {
                         else if (s_settings_idx == 1) {
                             s_current_mode = MODE_CATALOG;
                             s_settings_idx = 0; // Сбрасываем индекс для подменю
+
+                            // Автоматическая загрузка рабочего каталога при входе
+                            if (!catalog_is_validating() && !catalog_is_deep_validating() && !catalog_is_merging()) {
+                                if (catalog_get_staging_count() == 0) {
+                                    ESP_LOGI(TAG, "Auto-loading working catalog to staging...");
+                                    catalog_load_working_to_staging();
+                                }
+                            }
                         }
                         else if (s_settings_idx == 2) {
                             s_current_mode = MODE_ABOUT;
@@ -2003,26 +2627,31 @@ void ui_update() {
                             s_current_mode = MODE_PLAYBACK;
                         }
                     }
+
                     else if (s_current_mode == MODE_CATALOG) {
                         if (s_settings_idx == 0) {
-                            ESP_LOGI(TAG, "Catalog: Loading working catalog to staging...");
-                            catalog_load_working_to_staging();
-                        }
-                        else if (s_settings_idx == 1) {
                             ESP_LOGI(TAG, "Catalog: Importing M3U from SD...");
                             catalog_staging_load_from_m3u_dir(CATALOG_M3U_DIR);
                         }
-                        else if (s_settings_idx == 2) {
-                            ESP_LOGI(TAG, "Catalog: Starting background validation...");
+                        else if (s_settings_idx == 1) {
+                            ESP_LOGI(TAG, "Catalog: Starting background FAST validation...");
                             catalog_start_validation();
+                        }
+                        else if (s_settings_idx == 2) {
+                            ESP_LOGI(TAG, "Catalog: Starting DEEP validation of SUSPECT stations...");
+                            catalog_start_deep_validation();
                         }
                         else if (s_settings_idx == 3) {
                             ESP_LOGI(TAG, "Catalog: Merging staging to working...");
-                            catalog_staging_merge_to_working();
+                            catalog_start_merge();
                         }
                         else if (s_settings_idx == 4) {
+                            ESP_LOGI(TAG, "Catalog: Purging dead stations...");
+                            catalog_purge_dead_stations();
+                        }
+                        else if (s_settings_idx == 5) {
                             s_current_mode = MODE_SETTINGS;
-                            s_settings_idx = 1; // Возвращаемся на пункт "Catalog" в настройках
+                            s_settings_idx = 1;
                         }
                     }
                     else if (s_current_mode == MODE_ABOUT) {
@@ -2078,6 +2707,13 @@ void ui_set_playback_info(const char* station_name,
                           uint32_t buffer_target,
                           uint32_t starve_count,
                           uint32_t overflow_count) {
+	// При смене станции сбрасываем icy-метаданные
+	// (будут заполнены через ui_set_stream_meta при получении headers)
+	if (station_name && strcmp(station_name, s_station_name) != 0) {
+	    s_icy_name[0] = '\0';
+	    s_bitrate_kbps = 0;
+	    s_codec[0] = '\0';
+	}
     if (station_name) strncpy(s_station_name, station_name, sizeof(s_station_name) - 1);
     if (track_title) strncpy(s_track_title, track_title, sizeof(s_track_title) - 1);
     s_buffer_level = buffer_level;
@@ -2168,4 +2804,55 @@ void ui_set_wifi_scan_ready(bool ready) {
 void ui_set_current_mode(ui_mode_t mode) {
     s_current_mode = mode;
     s_encoder_accumulator = 0; // Сбрасываем накопитель энкодера, чтобы не было случайных сдвигов
+}
+
+void ui_set_stream_meta(const char* icy_name,
+                        int         bitrate_kbps,
+                        const char* content_type)
+{
+    // --- icy-name ---
+    if (icy_name && icy_name[0]) {
+        strncpy(s_icy_name, icy_name, sizeof(s_icy_name) - 1);
+        s_icy_name[sizeof(s_icy_name) - 1] = '\0';
+    } else {
+        s_icy_name[0] = '\0';
+    }
+
+    // --- bitrate ---
+    s_bitrate_kbps = (bitrate_kbps > 0 && bitrate_kbps < 10000) ? bitrate_kbps : 0;
+
+    // --- codec из Content-Type ---
+    s_codec[0] = '\0';
+    if (content_type && content_type[0]) {
+        if (strstr(content_type, "mpeg") || strstr(content_type, "mp3")) {
+            strcpy(s_codec, "MP3");
+        } else if (strstr(content_type, "aac")) {
+            strcpy(s_codec, "AAC");
+        } else if (strstr(content_type, "ogg") ||
+                   strstr(content_type, "vorbis") ||
+                   strstr(content_type, "opus")) {
+            strcpy(s_codec, "OGG");
+        } else if (strstr(content_type, "flac")) {
+            strcpy(s_codec, "FLAC");
+        } else if (strstr(content_type, "wav")) {
+            strcpy(s_codec, "WAV");
+        } else {
+            // Fallback: берём subtype из type/subtype
+            const char* slash = strchr(content_type, '/');
+            if (slash && slash[1]) {
+                const char* end = strchr(slash + 1, ';');
+                size_t n = end ? (size_t)(end - slash - 1) : strlen(slash + 1);
+                if (n >= sizeof(s_codec)) n = sizeof(s_codec) - 1;
+                memcpy(s_codec, slash + 1, n);
+                s_codec[n] = '\0';
+                for (size_t i = 0; s_codec[i]; i++)
+                    s_codec[i] = (char)toupper((unsigned char)s_codec[i]);
+            }
+        }
+    }
+}
+
+void ui_set_switch_phase(int phase)
+{
+    s_switch_phase = phase;
 }

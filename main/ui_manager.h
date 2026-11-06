@@ -57,6 +57,10 @@ void ui_set_playback_info(const char* station_name,
                           uint32_t starve_count,
                           uint32_t overflow_count);
 
+void ui_set_stream_meta(const char* icy_name,
+                        int         bitrate_kbps,
+                        const char* content_type);
+
 /**
  * @brief Получение последнего события от UI
  */
@@ -109,4 +113,6 @@ void ui_set_wifi_scan_ready(bool ready);
  * @brief Принудительно переключить режим UI извне (например, из главного цикла)
  */
 void ui_set_current_mode(ui_mode_t mode);
+
+void ui_set_switch_phase(int phase);
 

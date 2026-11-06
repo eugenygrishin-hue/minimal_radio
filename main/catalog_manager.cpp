@@ -19,6 +19,31 @@ static const char* TAG = "CATALOG";
 
 static void ensure_sd_radio_dir(void);
 
+static bool s_deep_validating = false;
+static int s_deep_validated_count = 0;
+static int s_total_to_deep_validate = 0;
+
+static volatile bool s_is_merging = false;
+static volatile int s_merge_progress = 0;
+static volatile catalog_merge_phase_t s_merge_phase = CATALOG_MERGE_PHASE_IDLE;
+static TaskHandle_t s_merge_task_handle = NULL;
+
+
+/**
+ * @brief Запускает merge staging -> working в фоновой задаче.
+ *
+ * UI должен вызывать именно эту функцию, а не catalog_staging_merge_to_working().
+ */
+bool catalog_start_merge(void);
+
+static bool catalog_merge_execute(void);
+static void catalog_merge_task(void* arg);
+
+/**
+ * @brief Текущая фаза фонового merge.
+ */
+catalog_merge_phase_t catalog_get_merge_phase(void);
+
 catalog_t g_catalog = {};
 
 // ---------------------------------------------------------------------
@@ -27,6 +52,75 @@ catalog_t g_catalog = {};
 
 static void ensure_sd_radio_dir(void) {
     mkdir("/sd/radio", 0777);
+}
+
+static bool catalog_find_station_ptr_by_id(uint32_t id,
+                                           catalog_station_t **out_station)
+{
+    if (out_station == nullptr) {
+        return false;
+    }
+
+    for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
+        catalog_category_t* cat = &g_catalog.categories[ci];
+
+        for (size_t si = 0; si < cat->count; si++) {
+            if (cat->stations[si].id == id) {
+                *out_station = &cat->stations[si];
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool catalog_set_station_health(uint32_t station_id,
+                                catalog_status_t status,
+                                uint32_t last_checked,
+                                uint32_t last_deep_checked,
+                                uint8_t fail_count,
+                                uint8_t consecutive_failures)
+{
+    catalog_station_t* st = nullptr;
+
+    if (!catalog_find_station_ptr_by_id(station_id, &st)) {
+        return false;
+    }
+
+    st->status = (uint8_t)status;
+    st->last_checked = last_checked;
+    st->last_deep_checked = last_deep_checked;
+    st->fail_count = fail_count;
+    st->consecutive_failures = consecutive_failures;
+
+    return true;
+}
+
+catalog_status_t catalog_get_station_status(uint32_t station_id)
+{
+    catalog_station_t* st = nullptr;
+
+    if (!catalog_find_station_ptr_by_id(station_id, &st)) {
+        return CAT_STATUS_UNKNOWN;
+    }
+
+    return (catalog_status_t)st->status;
+}
+
+const char* catalog_status_str(catalog_status_t status)
+{
+    switch (status) {
+        case CAT_STATUS_ALIVE:
+            return "ALIVE";
+        case CAT_STATUS_SUSPECT:
+            return "SUSPECT";
+        case CAT_STATUS_DEAD:
+            return "DEAD";
+        case CAT_STATUS_UNKNOWN:
+        default:
+            return "UNKNOWN";
+    }
 }
 
 static void copy_trunc(char* dst, size_t dst_size, const char* src)
@@ -839,7 +933,52 @@ bool catalog_load_json_file(const char* path)
                 id = catalog_make_station_id(cat->name, nm->valuestring);
             }
 
-            add_station_to_category(cat, nm->valuestring, url->valuestring, br, id);
+            /*
+             * Читаем статус.
+             *
+             * Новый формат:
+             *   "status": 0..3
+             *
+             * Старый формат / совместимость:
+             *   если status нет, но есть is_alive:
+             *     true  -> ALIVE
+             *     false -> SUSPECT
+             *
+             * Если ничего нет:
+             *   UNKNOWN
+             */
+            uint8_t status = CAT_STATUS_UNKNOWN;
+
+            cJSON* status_item = cJSON_GetObjectItemCaseSensitive(st_item, "status");
+            if (cJSON_IsNumber(status_item)) {
+                int v = status_item->valueint;
+                if (v >= CAT_STATUS_UNKNOWN && v <= CAT_STATUS_DEAD) {
+                    status = (uint8_t)v;
+                }
+            } else {
+                cJSON* alive_item = cJSON_GetObjectItemCaseSensitive(st_item, "is_alive");
+                if (cJSON_IsBool(alive_item)) {
+                    status = cJSON_IsTrue(alive_item)
+                             ? (uint8_t)CAT_STATUS_ALIVE
+                             : (uint8_t)CAT_STATUS_SUSPECT;
+                }
+            }
+
+            uint32_t last_checked = json_get_uint(st_item, "last_checked", 0);
+            uint32_t last_deep_checked = json_get_uint(st_item, "last_deep_checked", 0);
+            uint8_t fail_count = (uint8_t)json_get_uint(st_item, "fail_count", 0);
+            uint8_t consecutive_failures = (uint8_t)json_get_uint(st_item, "consecutive_failures", 0);
+
+            if (add_station_to_category(cat, nm->valuestring, url->valuestring, br, id)) {
+                catalog_set_station_health(
+                    id,
+                    (catalog_status_t)status,
+                    last_checked,
+                    last_deep_checked,
+                    fail_count,
+                    consecutive_failures
+                );
+            }
         }
     }
 
@@ -908,6 +1047,12 @@ bool catalog_save_json_file(const char* path)
             cJSON_AddStringToObject(sobj, "name", st->name);
             cJSON_AddStringToObject(sobj, "url", st->url);
             cJSON_AddNumberToObject(sobj, "bitrate", st->bitrate_kbps);
+
+            cJSON_AddNumberToObject(sobj, "status", st->status);
+            cJSON_AddNumberToObject(sobj, "last_checked", st->last_checked);
+            cJSON_AddNumberToObject(sobj, "last_deep_checked", st->last_deep_checked);
+            cJSON_AddNumberToObject(sobj, "fail_count", st->fail_count);
+            cJSON_AddNumberToObject(sobj, "consecutive_failures", st->consecutive_failures);
 
             cJSON_AddItemToArray(stations, sobj);
         }
@@ -1251,6 +1396,7 @@ static size_t s_staging_capacity = 0;
 static esp_log_level_t s_old_tls_level;
 static esp_log_level_t s_old_transport_level;
 static esp_log_level_t s_old_http_level;
+static esp_log_level_t s_old_tls_mbedtls_level;
 
 // Переменные для отслеживания прогресса валидации UI-ем
 static int s_staging_validated_count = 0;
@@ -1319,6 +1465,12 @@ int catalog_get_staging_count(void) {
 
 // Функция, которую вызывает UI для запуска валидации в фоне
 void catalog_start_validation(void) {
+
+	if (s_is_merging) {
+	    ESP_LOGW(TAG, "Cannot start validation while merge is running");
+	    return;
+	}
+
     if (s_staging_count == 0 || s_is_validating) {
         ESP_LOGW(TAG, "Nothing to validate or already validating");
         return;
@@ -1328,7 +1480,9 @@ void catalog_start_validation(void) {
     s_old_tls_level = esp_log_level_get("esp-tls");
     s_old_transport_level = esp_log_level_get("transport_base");
     s_old_http_level = esp_log_level_get("HTTP_CLIENT");
+    s_old_tls_mbedtls_level = esp_log_level_get("esp-tls-mbedtls");
 
+    esp_log_level_set("esp-tls-mbedtls", ESP_LOG_NONE);
     esp_log_level_set("esp-tls", ESP_LOG_NONE);
     esp_log_level_set("transport_base", ESP_LOG_NONE);
     esp_log_level_set("HTTP_CLIENT", ESP_LOG_NONE);
@@ -1342,7 +1496,7 @@ void catalog_start_validation(void) {
     xTaskCreatePinnedToCore(
         catalog_validation_task,
         "cat_validate",
-        4096,
+        10240,
         NULL,
         1, // Низкий приоритет, чтобы не мешать аудио и UI
         &s_validation_task_handle,
@@ -1419,8 +1573,11 @@ bool catalog_staging_load_from_m3u_dir(const char* dir_path) {
                         strncpy(ss->url, st->url, sizeof(ss->url) - 1);
                         strncpy(ss->group, group, sizeof(ss->group) - 1);
                         ss->bitrate_kbps = st->bitrate_kbps;
-                        ss->is_alive = false;
+                        ss->status = CAT_STATUS_UNKNOWN;
                         ss->last_checked = 0;
+                        ss->last_deep_checked = 0;
+                        ss->fail_count = 0;
+                        ss->consecutive_failures = 0;
                         total_parsed++;
                     }
                 }
@@ -1449,60 +1606,136 @@ bool catalog_staging_load_from_m3u_dir(const char* dir_path) {
 // ============================================================
 // Staging Validation & Merge Implementation
 // ============================================================
-static bool catalog_validate_station_url(const char* url) {
+static catalog_status_t catalog_validate_station_url_fast(const char* url) {
+    if (url == nullptr || url[0] == '\0') {
+        return CAT_STATUS_DEAD;
+    }
+
+    if (strncmp(url, "https://", 8) == 0) {
+        return CAT_STATUS_SUSPECT;
+    }
+
     esp_http_client_config_t config = {};
     config.url = url;
-    config.timeout_ms = 1500;
-    config.buffer_size = 512;
+    config.timeout_ms = 3000;
+    config.buffer_size = 4096;
     config.user_agent = "WinampMPEG/5.0";
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return false;
+    if (!client) {
+        return CAT_STATUS_SUSPECT;
+    }
 
     esp_http_client_set_header(client, "Icy-MetaData", "1");
 
-    if (esp_http_client_open(client, 0) != ESP_OK) {
+    esp_err_t open_err = esp_http_client_open(client, 0);
+    if (open_err != ESP_OK) {
         esp_http_client_cleanup(client);
-        return false;
+        return CAT_STATUS_SUSPECT;
     }
 
     esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
+    int status_code = esp_http_client_get_status_code(client);
 
-    if (status != 200 && status != 206) {
+    // Явные ошибки сервера
+    if (status_code >= 400) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        return false;
+
+        // 401/403 могут быть geo-block или auth — не убиваем сразу
+        if (status_code == 401 || status_code == 403) {
+            return CAT_STATUS_SUSPECT;
+        }
+
+        return CAT_STATUS_DEAD;
     }
 
+    if (status_code != 200 && status_code != 206) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return CAT_STATUS_SUSPECT;
+    }
+
+    // Content-Type
     char* ct = nullptr;
     esp_http_client_get_header(client, "Content-Type", &ct);
     if (ct && strcasestr(ct, "text/html")) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        return false;
+        return CAT_STATUS_DEAD;
     }
 
-    uint8_t buf[512];
-    int read_len = esp_http_client_read(client, (char*)buf, sizeof(buf));
+    /*
+     * ВАЖНО: не держать 4 KB на стеке задачи валидации.
+     * Используем static buffer, чтобы не переполнить стек.
+     */
+    static uint8_t s_validate_buf[4096];
+    uint8_t* buf = s_validate_buf;
+
+    int total_read = 0;
+
+    while (total_read < (int)sizeof(s_validate_buf)) {
+        int n = esp_http_client_read(client,
+                                     (char*)buf + total_read,
+                                     sizeof(s_validate_buf) - total_read);
+        if (n <= 0) {
+            break;
+        }
+        total_read += n;
+    }
+
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (read_len < 32) return false;
+    // Слишком мало данных
+    if (total_read < 32) {
+        return CAT_STATUS_DEAD;
+    }
+
+    if (total_read < 2048) {
+        return CAT_STATUS_SUSPECT;
+    }
 
     // Проверка магических чисел
-    if (buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') return true;
-    if (buf[0] == 'O' && buf[1] == 'g' && buf[2] == 'g' && buf[3] == 'S') return true;
-    if (buf[0] == 'f' && buf[1] == 'L' && buf[2] == 'a' && buf[3] == 'C') return true;
-    if (buf[0] == '#' && buf[1] == 'E' && buf[2] == 'X' && buf[3] == 'T') return true;
+    if (buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') {
+        return CAT_STATUS_ALIVE;
+    }
+    if (buf[0] == 'O' && buf[1] == 'g' && buf[2] == 'g' && buf[3] == 'S') {
+        return CAT_STATUS_ALIVE;
+    }
+    if (buf[0] == 'f' && buf[1] == 'L' && buf[2] == 'a' && buf[3] == 'C') {
+        return CAT_STATUS_ALIVE;
+    }
+    if (buf[0] == '#' && buf[1] == 'E' && buf[2] == 'X' && buf[3] == 'T') {
+        return CAT_STATUS_ALIVE;
+    }
 
-    for (int i = 0; i < read_len - 1 && i < 512; i++) {
-        if (buf[i] == 0xFF && (buf[i+1] & 0xE0) == 0xE0) {
-            return true;
+    // Поиск MP3/AAC sync words: 0xFF Ex/Fx
+    // Требруем минимум 2 sync-слова на разумном расстоянии
+    int sync_count = 0;
+    int last_sync_pos = -100;
+
+    for (int i = 0; i < total_read - 1; i++) {
+        if (buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0) {
+            // Проверяем, что это не просто 0xFF в данных
+            // Минимальное расстояние между sync: 100 байт
+            if (i - last_sync_pos >= 100) {
+                sync_count++;
+                last_sync_pos = i;
+            }
+            if (sync_count >= 2) {
+                return CAT_STATUS_ALIVE;
+            }
         }
     }
 
-    return false;
+    // Нашли 1 sync, но не 2 — suspect
+    if (sync_count == 1) {
+        return CAT_STATUS_SUSPECT;
+    }
+
+    // Нет аудиосигнатуры
+    return CAT_STATUS_SUSPECT;
 }
 
 int catalog_staging_validate(void) {
@@ -1519,13 +1752,31 @@ int catalog_staging_validate(void) {
     ESP_LOGI(TAG, "Starting validation of %d staging stations...", (int)s_staging_count);
 
     int alive_count = 0;
+    int suspect_count = 0;
+    int dead_count = 0;
+
     for (size_t i = 0; i < s_staging_count; i++) {
-        if (!s_staging[i].is_alive) {
-            bool alive = catalog_validate_station_url(s_staging[i].url);
-            s_staging[i].is_alive = alive;
+        if (s_staging[i].status != CAT_STATUS_ALIVE) {
+            catalog_status_t result = catalog_validate_station_url_fast(s_staging[i].url);
+
+            s_staging[i].status = (uint8_t)result;
             s_staging[i].last_checked = now;
-            if (alive) alive_count++;
+
+            switch (result) {
+                case CAT_STATUS_ALIVE:
+                    alive_count++;
+                    break;
+                case CAT_STATUS_SUSPECT:
+                    suspect_count++;
+                    break;
+                case CAT_STATUS_DEAD:
+                    dead_count++;
+                    break;
+                default:
+                    break;
+            }
         }
+
         s_staging_validated_count++;
 
         // Даем 50 мс на отрисовку UI и работу аудио-декодера
@@ -1533,74 +1784,40 @@ int catalog_staging_validate(void) {
     }
 
     s_is_validating = false;
-    ESP_LOGI(TAG, "Validation complete: %d alive out of %d checked", alive_count, (int)s_staging_count);
+    ESP_LOGI(TAG,
+             "Validation complete: ALIVE=%d SUSPECT=%d DEAD=%d total=%d",
+             alive_count, suspect_count, dead_count, (int)s_staging_count);
     return (int)s_staging_count;
-}
-
-bool catalog_staging_merge_to_working(void) {
-    if (s_staging_count == 0) {
-        ESP_LOGW(TAG, "Staging catalog is empty, nothing to merge");
-        return false;
-    }
-
-    int added_count = 0;
-    int skipped_count = 0;
-    int dead_count = 0;
-
-    ESP_LOGI(TAG, "Merging staging catalog to working catalog...");
-
-    for (size_t i = 0; i < s_staging_count; i++) {
-        if (!s_staging[i].is_alive) {
-            dead_count++;
-            continue;
-        }
-
-        // Проверяем, есть ли уже такая станция по ID (дедупликация по URL)
-        size_t cat_idx = 0, st_idx = 0;
-        if (catalog_find_station_by_id(s_staging[i].id, &cat_idx, &st_idx)) {
-            skipped_count++;
-            continue; // Уже есть в основном каталоге
-        }
-
-        // Добавляем в основной каталог
-        if (catalog_add_station(
-            s_staging[i].group[0] != '\0' ? s_staging[i].group : "Imported",
-            s_staging[i].name,
-            s_staging[i].url,
-            s_staging[i].bitrate_kbps
-        )) {
-            added_count++;
-        }
-    }
-
-    ESP_LOGI(TAG, "Merge complete: Added %d, Skipped (duplicate) %d, Dead %d",
-             added_count, skipped_count, dead_count);
-
-    // Сохраняем обновленный основной каталог на SD
-    ensure_sd_radio_dir();
-    bool ok = catalog_save_json_file(CATALOG_JSON_PATH);
-
-    // Очищаем staging после успешного слияния
-    if (ok) {
-        catalog_staging_clear();
-        ESP_LOGI(TAG, "Staging cleared after successful merge");
-    }
-
-    return ok;
 }
 
 static void catalog_validation_task(void *pvParameters) {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
     int alive_count = 0;
+    int suspect_count = 0;
+    int dead_count = 0;
 
     for (size_t i = 0; i < s_staging_count; i++) {
         if (!s_is_validating) break; // Если очистили каталог во время валидации
 
-        if (!s_staging[i].is_alive) {
-            bool alive = catalog_validate_station_url(s_staging[i].url);
-            s_staging[i].is_alive = alive;
-            s_staging[i].last_checked = now;
-            if (alive) alive_count++;
+        if (s_staging[i].status != CAT_STATUS_ALIVE) {
+        	catalog_status_t result = catalog_validate_station_url_fast(s_staging[i].url);
+
+        	s_staging[i].status = (uint8_t)result;
+        	s_staging[i].last_checked = now;
+
+        	switch (result) {
+        	    case CAT_STATUS_ALIVE:
+        	        alive_count++;
+        	        break;
+        	    case CAT_STATUS_SUSPECT:
+        	        suspect_count++;
+        	        break;
+        	    case CAT_STATUS_DEAD:
+        	        dead_count++;
+        	        break;
+        	    default:
+        	        break;
+        	}
         }
         s_staging_validated_count++;
 
@@ -1617,8 +1834,14 @@ static void catalog_validation_task(void *pvParameters) {
     esp_log_level_set("esp-tls", s_old_tls_level);
     esp_log_level_set("transport_base", s_old_transport_level);
     esp_log_level_set("HTTP_CLIENT", s_old_http_level);
+    esp_log_level_set("esp-tls-mbedtls", s_old_tls_mbedtls_level);
 
-    ESP_LOGI(TAG, "Validation complete: %d alive out of %d checked", alive_count, s_staging_total_count);
+    ESP_LOGI(TAG,
+             "Validation complete: ALIVE=%d SUSPECT=%d DEAD=%d total=%d",
+             alive_count,
+             suspect_count,
+             dead_count,
+             s_staging_total_count);
     s_is_validating = false;
     s_validation_task_handle = NULL;
     vTaskDelete(NULL);
@@ -1628,6 +1851,7 @@ static void catalog_validation_task(void *pvParameters) {
 // ============================================================
 // Загрузка текущего рабочего каталога в Staging (для очистки)
 // ============================================================
+
 bool catalog_load_working_to_staging(void) {
     if (!g_catalog.loaded || g_catalog.total_stations == 0) {
         ESP_LOGW(TAG, "Working catalog is empty, nothing to load");
@@ -1649,13 +1873,19 @@ bool catalog_load_working_to_staging(void) {
                 strncpy(ss->url, st->url, sizeof(ss->url) - 1);
                 strncpy(ss->group, cat->name, sizeof(ss->group) - 1);
                 ss->bitrate_kbps = st->bitrate_kbps;
-                ss->is_alive = false; // Сбрасываем, чтобы валидатор проверил заново
-                ss->last_checked = 0;
+
+                // --- ИСПРАВЛЕНО: копируем статус и health-данные из рабочего каталога ---
+                ss->status = st->status;
+                ss->last_checked = st->last_checked;
+                ss->last_deep_checked = st->last_deep_checked;
+                ss->fail_count = st->fail_count;
+                ss->consecutive_failures = st->consecutive_failures;
+                // ------------------------------------------------------------------------
             }
         }
     }
 
-    ESP_LOGI(TAG, "Working catalog loaded to staging: %d stations ready for validation", (int)s_staging_count);
+    ESP_LOGI(TAG, "Working catalog loaded to staging: %d stations ready", (int)s_staging_count);
     return s_staging_count > 0;
 }
 
@@ -1723,6 +1953,12 @@ bool catalog_remove_stations(const uint32_t* ids, size_t count) {
 // Удаление категории
 // ============================================================
 bool catalog_remove_category(size_t category_index) {
+
+    if (s_is_merging) {
+        ESP_LOGW(TAG, "Cannot remove category while merge is running");
+        return false;
+    }
+
     if (category_index >= g_catalog.category_count) return false;
 
     catalog_category_t* cat = &g_catalog.categories[category_index];
@@ -1803,4 +2039,485 @@ size_t catalog_remove_categories(const size_t* indices, size_t count) {
 
     ESP_LOGI(TAG, "Removed %d categories", (int)removed);
     return removed;
+}
+
+// main/catalog_manager.cpp
+
+// 1. Исправленная функция глубокой проверки (убран warning content_length)
+static catalog_status_t catalog_validate_station_url_deep(const char* url) {
+    if (url == nullptr || strlen(url) == 0) return CAT_STATUS_DEAD;
+    if (strncmp(url, "https://", 8) == 0) return CAT_STATUS_SUSPECT;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 10000;
+    config.user_agent = "WinampMPEG/5.0";
+    config.buffer_size = 4096;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return CAT_STATUS_SUSPECT;
+
+    esp_http_client_set_header(client, "Icy-MetaData", "1");
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return CAT_STATUS_DEAD;
+    }
+
+    // Используем (void), чтобы подавить warning о неиспользуемой переменной
+    (void)esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+
+    if (status_code < 200 || status_code >= 400) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return CAT_STATUS_DEAD;
+    }
+
+    static uint8_t s_deep_buf[32768];
+    int total_read = 0;
+    int sync_word_count = 0;
+
+    while (total_read < 32768) {
+        int read_len = esp_http_client_read(client, (char *)s_deep_buf + total_read, 32768 - total_read);
+        if (read_len <= 0) break;
+        total_read += read_len;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (total_read < 4096) return CAT_STATUS_SUSPECT;
+
+    // Ищем MP3 sync words (0xFF followed by 0xE0-0xFF)
+    for (int i = 0; i < total_read - 1; i++) {
+        if (s_deep_buf[i] == 0xFF && (s_deep_buf[i+1] & 0xE0) == 0xE0) {
+            sync_word_count++;
+            if (sync_word_count >= 5) {
+                return CAT_STATUS_ALIVE;
+            }
+        }
+    }
+
+    return (sync_word_count > 0) ? CAT_STATUS_SUSPECT : CAT_STATUS_DEAD;
+}
+
+bool catalog_is_deep_validating(void) {
+    return s_deep_validating;
+}
+
+int catalog_get_deep_validated_count(void) {
+    return s_deep_validated_count;
+}
+
+static void catalog_deep_validate_task(void *pvParameters) {
+
+	if (s_is_merging) {
+	    ESP_LOGW(TAG, "Cannot start validation while merge is running");
+	    return;
+	}
+
+    s_deep_validating = true;
+    s_deep_validated_count = 0;
+
+    int total = catalog_get_staging_count();
+    s_total_to_deep_validate = 0;
+
+    for (int i = 0; i < total; i++) {
+        if (s_staging[i].status == CAT_STATUS_SUSPECT) {
+            s_total_to_deep_validate++;
+        }
+    }
+
+    ESP_LOGI(TAG, "Deep validation started: %d suspects to check", s_total_to_deep_validate);
+
+    for (int i = 0; i < total; i++) {
+        if (!s_deep_validating) break;
+
+        if (s_staging[i].status == CAT_STATUS_SUSPECT) {
+            catalog_status_t result = catalog_validate_station_url_deep(s_staging[i].url);
+
+            s_staging[i].status = result;
+            s_staging[i].last_deep_checked = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+
+            s_deep_validated_count++;
+            vTaskDelay(pdMS_TO_TICKS(100)); // Даём подышать сети и аудио
+        }
+    }
+
+    ESP_LOGI(TAG, "Deep validation complete. Checked: %d", s_deep_validated_count);
+
+    s_deep_validating = false;
+    vTaskDelete(NULL);
+}
+
+void catalog_start_deep_validation(void) {
+    if (s_deep_validating || s_is_validating) {
+        ESP_LOGW(TAG, "Validation already in progress");
+        return;
+    }
+
+    int suspects = catalog_get_suspect_count();
+    if (suspects == 0) {
+        ESP_LOGI(TAG, "No SUSPECT stations to deep validate");
+        return;
+    }
+
+    xTaskCreatePinnedToCore(catalog_deep_validate_task, "deep_val", 8192, NULL, 3, NULL, 1);
+}
+
+// main/catalog_manager.cpp
+
+int catalog_get_alive_count(void) {
+    int count = 0;
+    int total = catalog_get_staging_count();
+    for (int i = 0; i < total; i++) {
+        if (s_staging[i].status == CAT_STATUS_ALIVE || s_staging[i].status == CAT_STATUS_UNKNOWN) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int catalog_get_suspect_count(void) {
+    int count = 0;
+    int total = catalog_get_staging_count();
+    for (int i = 0; i < total; i++) {
+        if (s_staging[i].status == CAT_STATUS_SUSPECT) count++;
+    }
+    return count;
+}
+
+int catalog_get_dead_count(void) {
+    int count = 0;
+    int total = catalog_get_staging_count();
+    for (int i = 0; i < total; i++) {
+        if (s_staging[i].status == CAT_STATUS_DEAD) count++;
+    }
+    return count;
+}
+
+bool catalog_purge_dead_stations(void) {
+    if (!g_catalog.loaded || g_catalog.total_stations == 0) {
+        ESP_LOGW(TAG, "Catalog is empty, nothing to purge");
+        return false;
+    }
+
+    if (s_is_merging) {
+        ESP_LOGW(TAG, "Cannot purge stations while merge is running");
+        return false;
+    }
+
+    size_t removed_count = 0;
+
+    // 1. Удаляем DEAD станции из рабочего каталога (RAM)
+    for (size_t ci = 0; ci < g_catalog.category_count; ci++) {
+        catalog_category_t* cat = &g_catalog.categories[ci];
+        size_t new_count = 0;
+
+        for (size_t si = 0; si < cat->count; si++) {
+            if (cat->stations[si].status == CAT_STATUS_DEAD) {
+                removed_count++;
+            } else {
+                if (new_count != si) {
+                    cat->stations[new_count] = cat->stations[si];
+                }
+                new_count++;
+            }
+        }
+        cat->count = new_count;
+    }
+    g_catalog.total_stations -= removed_count;
+
+    // 2. Чистим избранное от удаленных станций
+    for (size_t i = 0; i < g_catalog.favorite_count; ) {
+        uint32_t fav_id = g_catalog.favorite_ids[i];
+        size_t dummy_cat = 0, dummy_st = 0;
+        if (!catalog_find_station_by_id(fav_id, &dummy_cat, &dummy_st)) {
+            for (size_t j = i; j < g_catalog.favorite_count - 1; j++) {
+                g_catalog.favorite_ids[j] = g_catalog.favorite_ids[j + 1];
+            }
+            g_catalog.favorite_count--;
+        } else {
+            i++;
+        }
+    }
+
+    // 3. ВАЖНО: Также удаляем DEAD станции из буфера (staging),
+    // чтобы последующий Merge не добавил их обратно!
+    if (s_staging_count > 0) {
+        size_t new_staging_count = 0;
+        for (size_t i = 0; i < s_staging_count; i++) {
+            if (s_staging[i].status != CAT_STATUS_DEAD) {
+                if (new_staging_count != i) {
+                    s_staging[new_staging_count] = s_staging[i];
+                }
+                new_staging_count++;
+            }
+        }
+        s_staging_count = new_staging_count;
+    }
+
+    // 4. Сохраняем изменения на SD
+    if (removed_count > 0) {
+        ensure_sd_radio_dir();
+        catalog_save_json_file(CATALOG_JSON_PATH);
+        catalog_save_favorites();
+        ESP_LOGI(TAG, "Purged %d dead stations from catalog, favorites, and staging buffer", (int)removed_count);
+    } else {
+        ESP_LOGI(TAG, "No dead stations to purge");
+    }
+
+    return true;
+}
+
+
+bool catalog_is_merging(void) {
+    return s_is_merging;
+}
+
+int catalog_get_merge_progress(void) {
+    return s_merge_progress;
+}
+
+bool catalog_staging_merge_to_working(void) {
+    if (s_staging_count == 0) {
+        ESP_LOGW(TAG, "Staging catalog is empty, nothing to merge");
+        return false;
+    }
+
+    s_is_merging = true;
+    s_merge_progress = 0;
+
+    int added_count = 0;
+    int updated_count = 0;
+
+    ESP_LOGI(TAG, "11111 Merging staging catalog to working catalog...%d", s_staging_count);
+
+    for (size_t i = 0; i < s_staging_count; i++) {
+        // Обновляем прогресс для UI
+        s_merge_progress = (int)((i * 100) / s_staging_count);
+
+        // Даём CPU время на watchdog и аудио-декодер каждые 50 станций
+        if (i % 50 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        size_t cat_idx = 0, st_idx = 0;
+
+        if (catalog_find_station_by_id(s_staging[i].id, &cat_idx, &st_idx)) {
+            catalog_set_station_health(
+                s_staging[i].id,
+                (catalog_status_t)s_staging[i].status,
+                s_staging[i].last_checked,
+                s_staging[i].last_deep_checked,
+                s_staging[i].fail_count,
+                s_staging[i].consecutive_failures
+            );
+            updated_count++;
+        } else {
+            if (catalog_add_station(
+                s_staging[i].group[0] != '\0' ? s_staging[i].group : "Imported",
+                s_staging[i].name,
+                s_staging[i].url,
+                s_staging[i].bitrate_kbps
+            )) {
+                added_count++;
+                catalog_set_station_health(
+                    s_staging[i].id,
+                    (catalog_status_t)s_staging[i].status,
+                    s_staging[i].last_checked,
+                    s_staging[i].last_deep_checked,
+                    s_staging[i].fail_count,
+                    s_staging[i].consecutive_failures
+                );
+            }
+        }
+    }
+
+    s_merge_progress = 100;
+
+    ESP_LOGI(TAG, "Merge complete: Added %d, Updated %d", added_count, updated_count);
+
+    ensure_sd_radio_dir();
+    bool ok = catalog_save_json_file(CATALOG_JSON_PATH);
+
+    if (ok) {
+        catalog_staging_clear();
+        ESP_LOGI(TAG, "Staging cleared after successful merge");
+    }
+
+    s_is_merging = false;
+    return ok;
+}
+
+static bool catalog_merge_execute(void)
+{
+    if (s_staging_count == 0) {
+        ESP_LOGW(TAG, "Staging catalog is empty, nothing to merge");
+        return false;
+    }
+
+    int added_count = 0;
+    int updated_count = 0;
+
+    ESP_LOGI(TAG, "Merging staging catalog to working catalog... %d", (int)s_staging_count);
+
+    for (size_t i = 0; i < s_staging_count; i++) {
+        s_merge_progress = (int)((i * 100) / s_staging_count);
+
+        // Отдаём CPU сети, аудио и watchdog.
+        if ((i % 20) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        size_t cat_idx = 0;
+        size_t st_idx = 0;
+
+        if (catalog_find_station_by_id(s_staging[i].id, &cat_idx, &st_idx)) {
+            catalog_set_station_health(
+                s_staging[i].id,
+                (catalog_status_t)s_staging[i].status,
+                s_staging[i].last_checked,
+                s_staging[i].last_deep_checked,
+                s_staging[i].fail_count,
+                s_staging[i].consecutive_failures
+            );
+            updated_count++;
+        } else {
+            if (catalog_add_station(
+                    s_staging[i].group[0] != '\0' ? s_staging[i].group : "Imported",
+                    s_staging[i].name,
+                    s_staging[i].url,
+                    s_staging[i].bitrate_kbps)) {
+
+                added_count++;
+
+                catalog_set_station_health(
+                    s_staging[i].id,
+                    (catalog_status_t)s_staging[i].status,
+                    s_staging[i].last_checked,
+                    s_staging[i].last_deep_checked,
+                    s_staging[i].fail_count,
+                    s_staging[i].consecutive_failures
+                );
+            }
+        }
+    }
+
+    s_merge_progress = 100;
+    s_merge_phase = CATALOG_MERGE_PHASE_SAVE;
+
+    ESP_LOGI(TAG, "Merge complete: Added %d, Updated %d", added_count, updated_count);
+
+    ensure_sd_radio_dir();
+
+    bool ok = catalog_save_json_file(CATALOG_JSON_PATH);
+
+    if (ok) {
+        catalog_staging_clear();
+        ESP_LOGI(TAG, "Staging cleared after successful merge");
+    } else {
+        ESP_LOGW(TAG, "Failed to save catalog after merge");
+    }
+
+    return ok;
+}
+
+static void catalog_merge_task(void* arg)
+{
+    (void)arg;
+
+    bool ok = catalog_merge_execute();
+
+    ESP_LOGI(TAG, "Merge task finished, ok=%d", ok ? 1 : 0);
+
+    s_merge_phase = CATALOG_MERGE_PHASE_DONE;
+    s_is_merging = false;
+    s_merge_task_handle = NULL;
+
+    vTaskDelete(NULL);
+}
+
+bool catalog_start_merge(void)
+{
+    if (s_staging_count == 0) {
+        ESP_LOGW(TAG, "Staging catalog is empty, nothing to merge");
+        return false;
+    }
+
+    if (s_is_merging) {
+        ESP_LOGW(TAG, "Merge already in progress");
+        return false;
+    }
+
+    if (s_is_validating || s_deep_validating) {
+        ESP_LOGW(TAG, "Cannot merge while validation is running");
+        return false;
+    }
+
+    s_is_merging = true;
+    s_merge_phase = CATALOG_MERGE_PHASE_MERGE;
+    s_merge_progress = 0;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        catalog_merge_task,
+        "cat_merge",
+        16384,
+        NULL,
+        1,
+        &s_merge_task_handle,
+        1
+    );
+
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create merge task");
+        s_is_merging = false;
+        s_merge_phase = CATALOG_MERGE_PHASE_IDLE;
+        s_merge_progress = 0;
+        return false;
+    }
+
+    return true;
+}
+
+catalog_merge_phase_t catalog_get_merge_phase(void)
+{
+    return s_merge_phase;
+}
+
+void catalog_health_on_error(uint32_t station_id)
+{
+    if (s_is_merging) {
+        return;
+    }
+
+    catalog_station_t* st = nullptr;
+    if (!catalog_find_station_ptr_by_id(station_id, &st)) return;
+
+    st->fail_count++;
+    st->consecutive_failures++;
+    st->last_checked = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+
+    if (st->consecutive_failures >= 3) {
+        st->status = CAT_STATUS_DEAD;
+    } else {
+        st->status = CAT_STATUS_SUSPECT;
+    }
+}
+
+void catalog_health_on_stable(uint32_t station_id)
+{
+    if (s_is_merging) {
+        return;
+    }
+
+    catalog_station_t* st = nullptr;
+    if (!catalog_find_station_ptr_by_id(station_id, &st)) return;
+
+    if (st->status != CAT_STATUS_ALIVE) {
+        st->status = CAT_STATUS_ALIVE;
+        st->consecutive_failures = 0;
+        st->last_checked = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    }
 }

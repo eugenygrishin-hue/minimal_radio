@@ -20,6 +20,8 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 
+#include "esp_heap_caps.h"
+
 static const char* TAG = "AUDIO_OUT";
 
 /* ----------------------------------------------------------
@@ -110,6 +112,19 @@ static constexpr uint8_t DEFAULT_SPK_VOLUME_PERCENT = 30;
 
 static uint8_t s_hp_volume_percent  = DEFAULT_HP_VOLUME_PERCENT;
 static uint8_t s_spk_volume_percent = DEFAULT_SPK_VOLUME_PERCENT;
+
+//extern "C" void audio_output_set_fade_factor(int32_t factor)
+//{
+//    if (factor < 0) factor = 0;
+//    if (factor > 256) factor = 256;
+//    s_fade_factor = factor;
+//    s_fade_active = false;
+//    fade_apply_volume();
+//}
+
+// Транзитный буфер для затухших сэмплов (max stereo frames = 1152*2 = 2304)
+static int16_t* s_fade_buf = nullptr;
+static constexpr size_t FADE_BUF_SAMPLES = 2304;
 
 /* ----------------------------------------------------------
  * NVS persistence for separate volumes.
@@ -390,6 +405,104 @@ static void es8388_apply_volume(void)
     uint8_t v = es8388_volume_reg();
     es8388_write_reg(0x1A, v);
     es8388_write_reg(0x1B, v);
+}
+
+// ============================================================
+// А2: Software fade через громкость backend
+// Продвигается в esp_timer, независимо от write_pcm/rebuffering.
+// ============================================================
+static volatile int32_t  s_fade_factor   = 256; // 0..256
+static volatile int32_t  s_fade_target   = 256; // 0 (out) или 256 (in)
+static volatile uint32_t s_fade_dur_ms   = 0;
+static volatile uint32_t s_fade_start_ms = 0;
+static volatile bool     s_fade_active   = false;
+
+static esp_timer_handle_t s_fade_timer = nullptr;
+
+static void fade_apply_volume(void)
+{
+    int32_t f = s_fade_factor;
+    if (f < 0)   f = 0;
+    if (f > 256) f = 256;
+
+    if (s_current_headphone) {
+        uint32_t eff = ((uint32_t)s_hp_volume_percent * (uint32_t)f) / 256u;
+        uint8_t reg  = (uint8_t)(0xC0u - (eff * 0xC0u) / 100u);
+        es8388_write_reg(0x1A, reg);
+        es8388_write_reg(0x1B, reg);
+    } else {
+        uint32_t base = ((uint32_t)s_spk_volume_percent * 255u) / 100u;
+        uint32_t eff  = (base * (uint32_t)f) / 256u;
+        M5.Speaker.setVolume((uint8_t)eff);
+    }
+}
+
+static void fade_tick(void)
+{
+    if (!s_fade_active) return;
+
+    uint32_t now     = now_ms();
+    uint32_t elapsed = now - s_fade_start_ms;
+
+    if (elapsed >= s_fade_dur_ms) {
+        s_fade_factor = s_fade_target;
+        s_fade_active = false;
+        fade_apply_volume();
+        return;
+    }
+
+    float t = (float)elapsed / (float)s_fade_dur_ms;
+    if (t > 1.0f) t = 1.0f;
+
+    int32_t f;
+    if (s_fade_target == 0) {
+        float k = (1.0f - t) * (1.0f - t);
+        f = (int32_t)(256.0f * k + 0.5f);
+    } else {
+        float k = t * t;
+        f = (int32_t)(256.0f * k + 0.5f);
+    }
+
+    s_fade_factor = f;
+    fade_apply_volume();
+}
+
+static void fade_timer_cb(void* arg)
+{
+    (void)arg;
+    fade_tick();
+}
+
+extern "C" void audio_output_fade_out(uint32_t duration_ms)
+{
+    if (duration_ms == 0) duration_ms = 150;
+    s_fade_target   = 0;
+    s_fade_dur_ms   = duration_ms;
+    s_fade_start_ms = now_ms();
+    s_fade_active   = true;
+}
+
+extern "C" void audio_output_fade_in(uint32_t duration_ms)
+{
+    if (duration_ms == 0) duration_ms = 150;
+    s_fade_factor   = 0;
+    s_fade_target   = 256;
+    s_fade_dur_ms   = duration_ms;
+    s_fade_start_ms = now_ms();
+    s_fade_active   = true;
+    fade_apply_volume();
+}
+
+extern "C" bool audio_output_is_fading(void)     { return s_fade_active; }
+extern "C" bool audio_output_fade_out_done(void) { return (s_fade_factor <= 0); }
+
+extern "C" void audio_output_set_fade_factor(int32_t factor)
+{
+    if (factor < 0) factor = 0;
+    if (factor > 256) factor = 256;
+    s_fade_factor = factor;
+    s_fade_active = false;
+    fade_apply_volume();
 }
 
 static void es8388_init_common(void)
@@ -1064,6 +1177,18 @@ extern "C" void audio_output_init(void)
 
     audio_volume_load_from_nvs();
 
+    // А2: fade timer (15 мс), продвигает громкость независимо от write_pcm
+    if (!s_fade_timer) {
+        esp_timer_create_args_t ta = {};
+        ta.callback = fade_timer_cb;
+        ta.name     = "fade_tick";
+        if (esp_timer_create(&ta, &s_fade_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_fade_timer, 15000); // 15 мс
+        } else {
+            ESP_LOGW(TAG, "fade timer create failed, fade disabled");
+        }
+    }
+
     s_sample_rate = SPK_DEFAULT_RATE;
     s_spk_rate = SPK_DEFAULT_RATE;
 
@@ -1071,6 +1196,16 @@ extern "C" void audio_output_init(void)
     if (!spk_pool_alloc()) {
         ESP_LOGE(TAG, "SPK pool allocation failed");
     }
+
+    if (!s_fade_buf) {
+        s_fade_buf = (int16_t*)heap_caps_malloc(
+            FADE_BUF_SAMPLES * sizeof(int16_t),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_fade_buf) {
+            ESP_LOGW(TAG, "fade buf alloc failed, software fade disabled");
+        }
+    }
+
 
     /* Первичный debounce: 3 чтения подряд */
     int true_count = 0;
@@ -1120,6 +1255,8 @@ extern "C" void audio_output_init(void)
         switch_locked(true);
         xSemaphoreGive(s_mux);
     }
+
+    fade_apply_volume(); // синхронизируем backend с базовой громкостью + factor=256
 }
 
 extern "C" void audio_output_start(void)
@@ -1159,26 +1296,16 @@ extern "C" void audio_output_stop(void)
     xSemaphoreGive(s_mux);
 }
 
+static void fade_advance(void);
+
 extern "C" esp_err_t audio_output_write_pcm(const int16_t* samples,
                                             size_t frames,
                                             uint32_t sample_rate,
                                             uint8_t channels)
 {
-    if (s_mux == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (samples == nullptr || frames == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    /*
-     * Интерфейс адаптера рассчитан на stereo interleaved.
-     * Моно должен расширять до стерео вызывающий код (audio_player).
-     */
-    if (channels != 2) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (s_mux == nullptr) { return ESP_ERR_INVALID_STATE; }
+    if (samples == nullptr || frames == 0) { return ESP_ERR_INVALID_ARG; }
+    if (channels != 2) { return ESP_ERR_INVALID_ARG; }
 
     xSemaphoreTake(s_mux, portMAX_DELAY);
 
@@ -1213,7 +1340,7 @@ extern "C" esp_err_t audio_output_write_pcm(const int16_t* samples,
             }
         }
     } else {
-        /* Встроенный динамик: M5.Speaker + buffer pool + release callback */
+        /* Встроенный динамик */
         err = spk_write_pcm(samples, frames, sample_rate);
     }
 
@@ -1270,6 +1397,74 @@ extern "C" void audio_output_poll(void)
         }
     }
 }
+
+static inline void fade_advance(void)
+{
+    if (!s_fade_active) return;
+
+    uint32_t now = now_ms();
+    uint32_t elapsed = now - s_fade_start_ms; // wrap-safe для uint32
+
+    if (elapsed >= s_fade_dur_ms) {
+        s_fade_factor = s_fade_target;
+        s_fade_active = false;
+        return;
+    }
+
+    //int32_t sf = s_fade_start_factor;
+    //int32_t range = s_fade_target - sf; // -256 (out) или +256 (in)
+    //int32_t f = sf + (range * (int32_t)elapsed) / (int32_t)s_fade_dur_ms;
+
+    // Экспоненциальный fade: равномерное восприятие громкости
+    // t = elapsed / dur (0..1)
+    // Для fade out: factor = 256 * (1 - t)^2  (квадратичное затухание)
+    // Для fade in:  factor = 256 * t^2        (квадратичное нарастание)
+    float t = (float)elapsed / (float)s_fade_dur_ms;
+    if (t > 1.0f) t = 1.0f;
+
+    int32_t f;
+    if (s_fade_target == 0) {
+        // fade out: 256 -> 0
+        float k = (1.0f - t) * (1.0f - t);
+        f = (int32_t)(256.0f * k + 0.5f);
+    } else {
+        // fade in: 0 -> 256
+        float k = t * t;
+        f = (int32_t)(256.0f * k + 0.5f);
+    }
+
+    if (f < 0)   f = 0;
+    if (f > 256) f = 256;
+    s_fade_factor = f;
+
+
+    if (f < 0)   f = 0;
+    if (f > 256) f = 256;
+    s_fade_factor = f;
+}
+
+
+//extern "C" void audio_output_fade_in(uint32_t duration_ms)
+//{
+//    if (duration_ms == 0) duration_ms = 120;
+//    s_fade_factor       = 0;
+//    s_fade_start_factor = 0;
+//    s_fade_target       = 256;
+//    s_fade_dur_ms       = duration_ms;
+//    s_fade_start_ms     = now_ms();
+//    s_fade_active       = true;
+//}
+
+//extern "C" bool audio_output_is_fading(void)      { return s_fade_active; }
+//extern "C" bool audio_output_fade_out_done(void)  { return (s_fade_factor <= 0); }
+//
+//extern "C" void audio_output_set_fade_factor(int32_t factor)
+//{
+//    if (factor < 0) factor = 0;
+//    if (factor > 256) factor = 256;
+//    s_fade_factor = factor;
+//    s_fade_active = false;
+//}
 
 extern "C" void audio_output_set_volume(uint8_t volume_percent)
 {

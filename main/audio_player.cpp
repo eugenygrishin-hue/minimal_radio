@@ -24,6 +24,19 @@ static volatile bool g_playback_started = false;
 static int g_current_volume = 75;
 static bool g_is_muted = false;
 
+static volatile bool s_force_decode_reset = false;
+
+void audio_player_force_reset(void)
+{
+    s_force_decode_reset = true;
+    g_playback_started   = false; // ← НОВОЕ: сбрасываем триггер вывода
+}
+
+extern "C" bool audio_player_is_outputting(void)
+{
+    return g_playback_started;
+}
+
 static void decode_play_task(void* pvParameters)
 {
     HMP3Decoder mp3_decoder = MP3InitDecoder();
@@ -80,6 +93,16 @@ static void decode_play_task(void* pvParameters)
     audio_output_start();
 
     while (1) {
+
+        // === А2: принудительный сброс декодерного буфера ===
+        if (s_force_decode_reset) {
+            s_force_decode_reset = false;
+            bytes_in_buffer = 0;
+            memset(inbuf, 0, sizeof(inbuf));
+            ESP_LOGI(TAG, "Decode buffer force reset (station switch)");
+        }
+        // ==================================================
+
         /* 1. Underrun / rebuffering */
         if (bytes_in_buffer < REBUF_THRESHOLD) {
             ESP_LOGW(TAG, "Buffer underrun! Rebuffering...");
