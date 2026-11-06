@@ -989,7 +989,21 @@ static void draw_ui_impl(T& lcd) {
                 int global_idx = catalog_get_favorite_global_index(i);
                 const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
                 if (st == nullptr) continue; // Станция могла быть удалена из каталога
+                // --- Обработка статуса для избранного ---
+                char fav_display_name[128];
+                uint16_t base_color = TFT_WHITE;
+                const char* suffix = "";
 
+                if (st->status == CAT_STATUS_SUSPECT) {
+                    suffix = " [?]";
+                    base_color = 0xFFE0; // Желтый
+                } else if (st->status == CAT_STATUS_DEAD) {
+                    suffix = " [X]";
+                    base_color = 0x8430; // Темно-красный/серый
+                }
+
+                snprintf(fav_display_name, sizeof(fav_display_name), "%s%s", st->name, suffix);
+                // ----------------------------------------
                 if (i == s_fav_station_idx) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
@@ -1199,6 +1213,17 @@ static void draw_ui_impl(T& lcd) {
 
         lcd.setFont(&fonts::efontCN_16);
         lcd.setTextColor(TFT_WHITE);
+
+        // --- ДОБАВИТЬ: Цвет названия станции в зависимости от суффикса ---
+        uint16_t title_color = TFT_WHITE;
+        if (strstr(s_station_name, " [?]") != nullptr) {
+            title_color = 0xFFE0; // Желтый для SUSPECT
+        } else if (strstr(s_station_name, " [X]") != nullptr) {
+            title_color = 0x8430; // Темно-красный для DEAD
+        }
+        lcd.setTextColor(title_color);
+        // -----------------------------------------------------------------
+
         lcd.drawString(s_station_name, 10, 68);
 
         lcd.setFont(&fonts::efontCN_14);
@@ -1303,7 +1328,7 @@ static void draw_ui_impl(T& lcd) {
         }
 
         int visible_items = 5;
-        int cat_count = (int)catalog_category_count();
+        int cat_count = (int)catalog_category_count(); // <-- ПРАВИЛЬНАЯ ПЕРЕМЕННАЯ
         int total_items = cat_count + 1; // +1 для служебного пункта
 
         int start_idx = s_selected_category;
@@ -1311,6 +1336,8 @@ static void draw_ui_impl(T& lcd) {
         if (start_idx < 0) start_idx = 0;
 
         int y = 68;
+
+        // <-- ПРАВИЛЬНЫЙ ЦИКЛ ДЛЯ КАТЕГОРИЙ -->
         for (int i = start_idx; i < total_items && i < start_idx + visible_items; i++) {
             if (i < cat_count) {
                 // ---- Обычная категория ----
@@ -1377,7 +1404,7 @@ static void draw_ui_impl(T& lcd) {
         }
 
         int visible_items = 6;
-        int station_count = cur_cat ? (int)cur_cat->count : 0;
+        int station_count = cur_cat ? (int)cur_cat->count : 0; // <-- ОБЯЗАТЕЛЬНО ЗДЕСЬ
         int total_items = station_count + 1; // +1 для служебного пункта
 
         int start_idx = s_ui_station_idx;
@@ -1395,39 +1422,44 @@ static void draw_ui_impl(T& lcd) {
                 bool is_fav = catalog_is_favorite(st->id);
                 bool is_marked = is_station_marked(st->id);
 
+                // 1. Определяем суффикс и цвет на основе статуса
+                const char* status_suffix = "";
+                uint16_t base_color = TFT_WHITE;
+
+                if (st->status == CAT_STATUS_SUSPECT) {
+                    status_suffix = " [?]";
+                    base_color = 0xFFE0; // Желтый
+                } else if (st->status == CAT_STATUS_DEAD) {
+                    status_suffix = " [X]";
+                    base_color = 0x8430; // Темно-красный/серый
+                } else if (is_marked) {
+                    base_color = 0xF800; // Красный (если отмечена для удаления)
+                }
+
+                // 2. Формируем итоговую строку ОДИН РАЗ (без конфликтов имен)
+                char final_name[128];
+                if (s_selection_mode) {
+                    snprintf(final_name, sizeof(final_name), "%s %s%s",
+                             is_marked ? "[x]" : "[ ]", st->name, status_suffix);
+                } else {
+                    snprintf(final_name, sizeof(final_name), "%s %s%s",
+                             is_fav ? "★" : " ", st->name, status_suffix);
+                }
+
+                // 3. Рисуем выделение или фон
                 if (i == s_ui_station_idx) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);
                 } else {
-                    if (is_marked) {
-                        lcd.setTextColor(TFT_RED); // Отмеченные — красные
-                    } else {
-                        lcd.setTextColor(TFT_WHITE);
-                    }
+                    lcd.setTextColor(base_color);
                 }
 
+                // 4. Рисуем ИТОГОВОЕ имя (с суффиксом и звездочкой/чекбоксом)
                 lcd.setFont(&fonts::efontCN_16);
+                lcd.drawString(final_name, 15, y);
 
-                char display_name[CATALOG_MAX_NAME_LEN + 16];
-                if (s_selection_mode) {
-                    // В режиме выделения показываем чекбоксы
-                    if (is_marked) {
-                        snprintf(display_name, sizeof(display_name), "[x] %s", st->name);
-                    } else {
-                        snprintf(display_name, sizeof(display_name), "[ ] %s", st->name);
-                    }
-                } else {
-                    // В обычном режиме показываем звёздочку для избранных
-                    if (is_fav) {
-                        snprintf(display_name, sizeof(display_name), "★ %s", st->name);
-                    } else {
-                        snprintf(display_name, sizeof(display_name), "  %s", st->name);
-                    }
-                }
-
-                lcd.drawString(display_name, 15, y);
             } else {
-                // ---- Служебный пункт ----
+                // ---- Служебный пункт (>> Режим выделения) ----
                 if (i == s_ui_station_idx) {
                     lcd.setTextColor(TFT_BLACK);
                     lcd.fillRoundRect(5, y - 5, 310, 24, 4, 0x07E0);

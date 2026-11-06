@@ -16,6 +16,8 @@
 #include "config.h"
 #include "cp1251_table.h"
 
+#include "catalog_manager.h"
+
 static const char *TAG = "HTTP_STREAM";
 
 static RingbufHandle_t s_ringbuf = NULL;
@@ -29,6 +31,8 @@ static SemaphoreHandle_t s_http_mutex = NULL;
 static char s_stream_title[128] = "Connecting...";
 static int s_metaint = 0;
 static char s_http_last_url[256] = {0};
+
+static uint32_t s_current_station_id = 0;
 
 
 // =====================================================================
@@ -207,7 +211,7 @@ static void http_read_task(void *pvParameters) {
             config.url = url;
             config.buffer_size = 4096;
             config.crt_bundle_attach = esp_crt_bundle_attach;
-            config.timeout_ms = 1000;
+            config.timeout_ms = 10000;
             // ============================
             config.user_agent = "WinampMPEG/5.0"; // Или "VLC/3.0.0 LibVLC/3.0.0"
             // ============================
@@ -226,6 +230,13 @@ static void http_read_task(void *pvParameters) {
 
             if (esp_http_client_open(client, 0) != ESP_OK) {
                 ESP_LOGW(TAG, "HTTP open failed, retry in %d ms", retry_delay_ms);
+
+
+            if (s_current_station_id > 0) {
+            	catalog_health_on_error(s_current_station_id);
+            }
+
+
                 esp_http_client_cleanup(client);
                 client = NULL;
 
@@ -246,6 +257,11 @@ static void http_read_task(void *pvParameters) {
 
             retry_delay_ms = 1000;
             ESP_LOGI(TAG, "HTTP connected, metaint=%d", s_metaint);
+
+            if (s_current_station_id > 0) {
+                catalog_health_on_stable(s_current_station_id);
+            }
+
         }
 
         if (s_force_stop) break;
@@ -253,6 +269,10 @@ static void http_read_task(void *pvParameters) {
         int read_len = esp_http_client_read(client, (char *)net_buf, 4096);
         if (read_len <= 0) {
             ESP_LOGW(TAG, "HTTP read returned %d, reconnecting in %d ms", read_len, retry_delay_ms);
+
+            if (s_current_station_id > 0) {
+                catalog_health_on_error(s_current_station_id);
+            }
 
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
@@ -451,12 +471,12 @@ void http_stream_stop(void) {
     xSemaphoreGive(s_http_mutex);
 }
 
-void http_stream_start(const char *url) {
-
-	if (url != nullptr) {
-	    strncpy(s_http_last_url, url, sizeof(s_http_last_url) - 1);
-	    s_http_last_url[sizeof(s_http_last_url) - 1] = '\0';
-	}
+void http_stream_start(const char *url, uint32_t station_id) {
+    s_current_station_id = station_id;
+    if (url != nullptr) {
+        strncpy(s_http_last_url, url, sizeof(s_http_last_url) - 1);
+        s_http_last_url[sizeof(s_http_last_url) - 1] = '\0';
+    }
 
     if (s_http_mutex == NULL) return;
 
@@ -493,12 +513,10 @@ uint32_t http_stream_get_ring_fill(void) {
     return used;
 }
 
-void http_stream_restart(void) {
-    if (s_http_last_url[0] == '\0') {
-        ESP_LOGW(TAG, "http_stream_restart: no last URL stored");
-        return;
-    }
+// main/http_stream.cpp
 
-    ESP_LOGI(TAG, "http_stream_restart: restarting with URL: %s", s_http_last_url);
-    http_stream_start(s_http_last_url);
+void http_stream_restart(void) {
+    http_stream_stop();
+    // Передаем сохраненный ID станции при рестарте
+    http_stream_start(s_http_last_url, s_current_station_id);
 }

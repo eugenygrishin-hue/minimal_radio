@@ -11,14 +11,26 @@
 #define CATALOG_MAX_URL_LEN       256
 #define CATALOG_MAX_CATEGORY_LEN  48
 
+typedef enum {
+    CAT_STATUS_UNKNOWN = 0,
+    CAT_STATUS_ALIVE   = 1,
+    CAT_STATUS_SUSPECT = 2,
+    CAT_STATUS_DEAD    = 3
+} catalog_status_t;
+
 typedef struct {
     uint32_t id;
     char name[CATALOG_MAX_NAME_LEN + 1];
     char url[CATALOG_MAX_URL_LEN + 1];
-    char group[CATALOG_MAX_CATEGORY_LEN + 1]; // <-- НОВОЕ: для M3U групп
+    char group[CATALOG_MAX_CATEGORY_LEN + 1];
+
     uint16_t bitrate_kbps;
-    bool is_alive;          // <-- НОВОЕ: для staging-валидации
-    uint32_t last_checked;  // <-- НОВОЕ: timestamp последней проверки
+
+    uint8_t status;
+    uint32_t last_checked;
+    uint32_t last_deep_checked;
+    uint8_t fail_count;
+    uint8_t consecutive_failures;
 } catalog_station_t;
 
 typedef struct {
@@ -101,9 +113,14 @@ typedef struct {
     char name[CATALOG_MAX_NAME_LEN + 1];
     char url[CATALOG_MAX_URL_LEN + 1];
     char group[CATALOG_MAX_CATEGORY_LEN + 1];
+
     uint16_t bitrate_kbps;
-    bool is_alive;
+
+    uint8_t status;
     uint32_t last_checked;
+    uint32_t last_deep_checked;
+    uint8_t fail_count;
+    uint8_t consecutive_failures;
 } staging_station_t;
 
 bool catalog_staging_load_from_m3u_dir(const char* dir_path);
@@ -197,4 +214,27 @@ bool catalog_remove_category(size_t category_index);
  * @return Количество реально удалённых категорий.
  */
 size_t catalog_remove_categories(const size_t* indices, size_t count);
+
+/**
+ * @brief Установить health-статус станции в рабочем каталоге по ID.
+ */
+bool catalog_set_station_health(uint32_t station_id,
+                                catalog_status_t status,
+                                uint32_t last_checked,
+                                uint32_t last_deep_checked,
+                                uint8_t fail_count,
+                                uint8_t consecutive_failures);
+
+/**
+ * @brief Получить статус станции из рабочего каталога.
+ */
+catalog_status_t catalog_get_station_status(uint32_t station_id);
+
+void catalog_health_on_error(uint32_t station_id);
+void catalog_health_on_stable(uint32_t station_id);
+
+/**
+ * @brief Человекочитаемое имя статуса.
+ */
+const char* catalog_status_str(catalog_status_t status);
 

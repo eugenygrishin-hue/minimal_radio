@@ -8,6 +8,7 @@
 #include "catalog_manager.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <M5Unified.hpp>
@@ -35,6 +36,10 @@ static uint64_t g_wifi_reconnect_started_ms = 0;
 static bool g_sntp_started = false;
 
 static portMUX_TYPE g_wifi_test_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static int g_previous_station = 0;
+static uint64_t g_station_change_time_ms = 0;
+static bool g_rollback_handled = false;
 
 
 static const char* get_station_url_from_catalog(int index) {
@@ -196,7 +201,9 @@ extern "C" void app_main(void) {
 
     // 7. Инициализация HTTP стрима
     http_stream_init(ringbuf);
-    http_stream_start(get_station_url_from_catalog(g_selected_station));
+
+    const catalog_station_t* st_init = catalog_get_station_by_global_index(g_selected_station);
+    http_stream_start(get_station_url_from_catalog(g_selected_station), st_init ? st_init->id : 0);
 
     // 8.
 
@@ -206,6 +213,35 @@ extern "C" void app_main(void) {
     while (1) {
         // Обновляем UI
         ui_update();
+
+
+        // --- Логика авто-отката при быстрой смерти станции ---
+        const catalog_station_t* current_st = catalog_get_station_by_global_index(g_selected_station);
+
+        // ДОБАВЛЕНО: !g_rollback_handled, чтобы не спамить на каждой итерации цикла
+        if (current_st != nullptr && current_st->status == CAT_STATUS_DEAD && !g_rollback_handled) {
+            uint64_t now_ms = esp_timer_get_time() / 1000;
+
+            if (now_ms - g_station_change_time_ms < 45000) {
+                const catalog_station_t* prev_st = catalog_get_station_by_global_index(g_previous_station);
+
+                if (g_previous_station >= 0 && prev_st != nullptr && prev_st->status == CAT_STATUS_ALIVE) {
+                    ESP_LOGW(TAG, "Station died quickly, rolling back to healthy previous: %d", g_previous_station);
+
+                    g_selected_station = g_previous_station;
+                    g_station_change_time_ms = now_ms;
+
+                    storage_save_station(g_selected_station);
+                    http_stream_start(get_station_url_from_catalog(g_selected_station), prev_st->id);
+                } else {
+                    ESP_LOGW(TAG, "Station died, but previous station is unhealthy/invalid. Stopping playback.");
+                    http_stream_stop();
+                }
+
+                g_rollback_handled = true; // <-- УСТАНАВЛИВАЕМ ФЛАГ, ЧТО МЫ УЖЕ ПРИНЯЛИ РЕШЕНИЕ
+            }
+        }
+        // ----------------------------------------------------------------
 
         // Если Wi-Fi появился позже (например, после реконнекта) — запускаем SNTP
         if (!g_sntp_started && wifi_is_connected()) {
@@ -273,15 +309,36 @@ extern "C" void app_main(void) {
             !http_stream_is_running()) {
 
             ESP_LOGI(TAG, "Restarting stream after successful Wi-Fi test");
-            http_stream_start(get_station_url_from_catalog(g_selected_station));
+
+            const catalog_station_t* st_restart = catalog_get_station_by_global_index(g_selected_station);
+            http_stream_start(get_station_url_from_catalog(g_selected_station), st_restart ? st_restart->id : 0);
             g_restart_stream_after_wifi = false;
         }
 
         uint32_t starve, overflow;
         audio_get_stats(&starve, &overflow);
 
+
+        // --- ДОБАВИТЬ: Формирование имени станции с суффиксом статуса ---
+        const char* base_name = get_station_name(g_selected_station);
+        char display_name[128];
+
+        const catalog_station_t* current_st_info = catalog_get_station_by_global_index(g_selected_station);
+        if (current_st_info != nullptr) {
+            if (current_st_info->status == CAT_STATUS_SUSPECT) {
+                snprintf(display_name, sizeof(display_name), "%s [?]", base_name);
+            } else if (current_st_info->status == CAT_STATUS_DEAD) {
+                snprintf(display_name, sizeof(display_name), "%s [X]", base_name);
+            } else {
+                snprintf(display_name, sizeof(display_name), "%s", base_name);
+            }
+        } else {
+            snprintf(display_name, sizeof(display_name), "%s", base_name);
+        }
+        // ----------------------------------------------------------------
+
         ui_set_playback_info(
-            get_station_name(g_selected_station),
+            display_name, // <-- ПЕРЕДАЕМ ИМЯ С СУФФИКСОМ
             http_stream_get_title(),
             audio_get_buffer_level(),
             PREFILL_TARGET,
@@ -297,6 +354,23 @@ extern "C" void app_main(void) {
         ui_event_t event = ui_get_event();
 
         if (event == UI_EVENT_STATION_CHANGED) {
+
+            g_previous_station = g_selected_station;            // <-- ДОБАВИТЬ
+            g_station_change_time_ms = esp_timer_get_time() / 1000; // <-- ДОБАВИТЬ
+
+            // --- УЛУЧШЕННАЯ ЛОГИКА: запоминаем предыдущую станцию ТОЛЬКО если она здорова ---
+            const catalog_station_t* current_st = catalog_get_station_by_global_index(g_selected_station);
+            if (current_st != nullptr && current_st->status == CAT_STATUS_ALIVE) {
+                g_previous_station = g_selected_station; // Безопасная точка возврата
+            } else {
+                g_previous_station = -1; // Пользователь сбегает с плохой станции, не возвращать его туда!
+            }
+
+            g_station_change_time_ms = esp_timer_get_time() / 1000;
+            g_rollback_handled = false;
+            // -----------------------------------------------------------------------------
+
+
             g_selected_station = ui_get_selected_station();
 
             // Сохраняем и индекс (для обратной совместимости), и ID (для надежности)
@@ -305,9 +379,11 @@ extern "C" void app_main(void) {
             const catalog_station_t* st = catalog_get_station_by_global_index(g_selected_station);
             if (st != nullptr) {
                 storage_save_last_station_id(st->id);
-            }
 
-            http_stream_start(get_station_url_from_catalog(g_selected_station));
+            http_stream_start(get_station_url_from_catalog(g_selected_station), st->id);
+        } else {
+            http_stream_start(get_station_url_from_catalog(g_selected_station), 0);
+        }
             ESP_LOGI(TAG, "Station changed to %d: %s", g_selected_station, get_station_name(g_selected_station));
         }
         else if (event == UI_EVENT_WIFI_SCAN_REQUESTED) {

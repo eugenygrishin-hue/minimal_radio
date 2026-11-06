@@ -11,7 +11,8 @@ extern "C" {
 #include <stdbool.h>
 
 void http_stream_init(RingbufHandle_t ringbuf);
-void http_stream_start(const char* url);
+
+void http_stream_start(const char* url, uint32_t station_id);
 void http_stream_stop();
 void http_stream_request_stop();       // <-- NEW: неблокирующая просьба остановиться
 bool http_stream_is_running();         // <-- NEW
