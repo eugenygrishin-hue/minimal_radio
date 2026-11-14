@@ -452,12 +452,11 @@ extern "C" void app_main(void)
 
                         g_selected_station = g_previous_station;
                         g_station_change_time_ms = now_ms;
-
                         storage_save_station(g_selected_station);
-
-                        http_stream_start(
-                            get_station_url_from_catalog(g_selected_station),
-                            prev_st->id);
+                        if (prev_st != nullptr) {
+                            storage_save_last_station_id(prev_st->id);   // ← НОВОЕ
+                        }
+                        http_stream_start(get_station_url_from_catalog(g_selected_station), prev_st->id);
                     } else {
                         ESP_LOGW(TAG,
                                  "Station died, but previous station is unhealthy/invalid. Stopping playback.");
