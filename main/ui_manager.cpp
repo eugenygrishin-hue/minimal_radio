@@ -2113,7 +2113,7 @@ static void draw_ui_impl(T& lcd) {
                              s_fav_toast_text, 0x07E0);
             } else {
                 draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT,
-                             "A:Play B:Mode Enc:Vol Long:Fav",
+                	         "A:Set B:Mode Enc:Fav Long:Mute",
                              TFT_DARKGREY);
             }
         }
@@ -2901,31 +2901,7 @@ void ui_update() {
                 }
                 else if (s_current_mode == MODE_WIFI) {
                     wifi_back_action();
-                }
-                else if (s_current_mode == MODE_PLAYBACK) {
-                    // E5: toggle favorite текущей играющей станции
-                    if (s_playing_station_gidx >= 0) {
-                        const catalog_station_t* st =
-                            catalog_get_station_by_global_index(
-                                (size_t)s_playing_station_gidx);
-
-                        if (st != nullptr) {
-                            bool added = catalog_toggle_favorite(st->id);
-                            catalog_save_favorites();
-
-                            ESP_LOGI(TAG, "Favorite %s: %s (from PLAY)",
-                                     added ? "ADDED" : "REMOVED", st->name);
-
-                            s_fav_toast_ms =
-                                (uint32_t)(esp_timer_get_time() / 1000);
-                            strlcpy(s_fav_toast_text,
-                                    added ? "* In Favorites"
-                                          : "- From Favorites",
-                                    sizeof(s_fav_toast_text));
-                        }
-                    }
-                }
-                else {
+                } else {
                     // MUTE в остальных режимах (STA, FAV, CAT, SET, ABOUT, WIFI)
                     s_is_muted = !s_is_muted;
                     s_pending_event = UI_EVENT_MUTE_TOGGLED;
@@ -3134,6 +3110,28 @@ void ui_update() {
                             }
                             else if (s_wifi_focus == 5) {
                                 wifi_back_action();
+                            }
+                        }
+                    } else if (s_current_mode == MODE_PLAYBACK) {
+                        // E22: короткий клик = favorite toggle
+                        if (s_playing_station_gidx >= 0) {
+                            const catalog_station_t* st =
+                                catalog_get_station_by_global_index(
+                                    (size_t)s_playing_station_gidx);
+
+                            if (st != nullptr) {
+                                bool added = catalog_toggle_favorite(st->id);
+                                catalog_save_favorites();
+
+                                ESP_LOGI(TAG, "Favorite %s: %s (from PLAY click)",
+                                         added ? "ADDED" : "REMOVED", st->name);
+
+                                s_fav_toast_ms =
+                                    (uint32_t)(esp_timer_get_time() / 1000);
+                                strlcpy(s_fav_toast_text,
+                                        added ? "* In Favorites"
+                                              : "- From Favorites",
+                                        sizeof(s_fav_toast_text));
                             }
                         }
                     }
