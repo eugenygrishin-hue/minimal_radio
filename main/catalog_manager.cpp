@@ -1963,6 +1963,9 @@ bool catalog_remove_category(size_t category_index) {
 
     catalog_category_t* cat = &g_catalog.categories[category_index];
 
+    // E20: чистим сирот после удаления категории
+    // (универсальная функция, сканирует всё избранное)
+
     // 1. Удаляем станции внутри категории
     if (cat->stations) {
         heap_caps_free(cat->stations);
@@ -1979,6 +1982,7 @@ bool catalog_remove_category(size_t category_index) {
     // 3. Сохраняем обновленный каталог на SD
     if (sd_manager_is_mounted()) {
         ensure_sd_radio_dir();
+        catalog_save_favorites();   // ← E20
         catalog_save_json_file(CATALOG_JSON_PATH);
     }
 
@@ -2031,10 +2035,16 @@ size_t catalog_remove_categories(const size_t* indices, size_t count) {
         removed++;
     }
 
-    // Сохраняем обновлённый каталог на SD
+    // === E20-fix: чистим сирот в избранном ===
+    if (removed > 0) {
+        catalog_cleanup_orphan_favorites();
+    }
+
+    // Сохраняем обновлённый каталог + избранное на SD
     if (removed > 0 && sd_manager_is_mounted()) {
         ensure_sd_radio_dir();
         catalog_save_json_file(CATALOG_JSON_PATH);
+        catalog_save_favorites();   // ← НОВОЕ
     }
 
     ESP_LOGI(TAG, "Removed %d categories", (int)removed);
@@ -2229,19 +2239,8 @@ bool catalog_purge_dead_stations(void) {
     }
     g_catalog.total_stations -= removed_count;
 
-    // 2. Чистим избранное от удаленных станций
-    for (size_t i = 0; i < g_catalog.favorite_count; ) {
-        uint32_t fav_id = g_catalog.favorite_ids[i];
-        size_t dummy_cat = 0, dummy_st = 0;
-        if (!catalog_find_station_by_id(fav_id, &dummy_cat, &dummy_st)) {
-            for (size_t j = i; j < g_catalog.favorite_count - 1; j++) {
-                g_catalog.favorite_ids[j] = g_catalog.favorite_ids[j + 1];
-            }
-            g_catalog.favorite_count--;
-        } else {
-            i++;
-        }
-    }
+    // 2. Чистим сирот в избранном (универсальная функция)
+    catalog_cleanup_orphan_favorites();
 
     // 3. ВАЖНО: Также удаляем DEAD станции из буфера (staging),
     // чтобы последующий Merge не добавил их обратно!
@@ -2345,6 +2344,17 @@ bool catalog_staging_merge_to_working(void) {
     if (ok) {
         catalog_staging_clear();
         ESP_LOGI(TAG, "Staging cleared after successful merge");
+
+        // Safety net: если merge применил DEAD-статусы и пользователь
+        // позже удалил станции — на всякий случай чистим сирот.
+        // В норме их быть не должно (merge не удаляет), но это страховка.
+        int orphans = catalog_cleanup_orphan_favorites();
+        if (orphans > 0) {
+            catalog_save_favorites();
+            ESP_LOGW(TAG, "Post-merge: cleaned %d unexpected orphaned favorites", orphans);
+        }
+    } else {
+        ESP_LOGW(TAG, "Failed to save catalog after merge");
     }
 
     s_is_merging = false;
@@ -2417,6 +2427,15 @@ static bool catalog_merge_execute(void)
     if (ok) {
         catalog_staging_clear();
         ESP_LOGI(TAG, "Staging cleared after successful merge");
+
+        // Safety net: если merge применил DEAD-статусы и пользователь
+        // позже удалил станции — на всякий случай чистим сирот.
+        // В норме их быть не должно (merge не удаляет), но это страховка.
+        int orphans = catalog_cleanup_orphan_favorites();
+        if (orphans > 0) {
+            catalog_save_favorites();
+            ESP_LOGW(TAG, "Post-merge: cleaned %d unexpected orphaned favorites", orphans);
+        }
     } else {
         ESP_LOGW(TAG, "Failed to save catalog after merge");
     }
@@ -2570,4 +2589,32 @@ bool catalog_staging_add_station(uint32_t id,
     ss->consecutive_failures = 0;
 
     return true;
+}
+
+int catalog_cleanup_orphan_favorites(void)
+{
+    int removed = 0;
+
+    for (size_t i = 0; i < g_catalog.favorite_count; ) {
+        uint32_t fid = g_catalog.favorite_ids[i];
+        size_t dummy_cat = 0, dummy_st = 0;
+
+        if (!catalog_find_station_by_id(fid, &dummy_cat, &dummy_st)) {
+            // ID не найден в working → сирота, удаляем
+            for (size_t k = i; k < g_catalog.favorite_count - 1; k++) {
+                g_catalog.favorite_ids[k] = g_catalog.favorite_ids[k + 1];
+            }
+            g_catalog.favorite_count--;
+            removed++;
+            // НЕ инкрементируем i — на этом месте теперь следующий элемент
+        } else {
+            i++;
+        }
+    }
+
+    if (removed > 0) {
+        ESP_LOGI(TAG, "Cleaned %d orphaned favorites", removed);
+    }
+
+    return removed;
 }

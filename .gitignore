@@ -7,3 +7,4 @@ sdkconfig.old
 .project
 .cproject
 .DS_Store
+sources.txt

@@ -962,21 +962,6 @@ static int utf8_copy_nth_char(const char* src, int n, char* dst, int dst_sz)
 }
 
 // ============================================================
-// Временный фикс: й→и, ё→е, Ё→Е, Й→И (для efontCN_14)
-// TODO: удалить после подключения кастомного кириллического шрифта
-// ============================================================
-//static void fix_cyr_temp(char* s)
-//{
-//    if (!s) return;
-//    for (unsigned char* p = (unsigned char*)s; *p; ++p) {
-//        if (p[0] == 0xD0 && p[1] == 0xB9) { p[1] = 0xB8; p++; continue; }
-//        if (p[0] == 0xD0 && p[1] == 0x81) { p[1] = 0x95; p++; continue; }
-//        if (p[0] == 0xD0 && p[1] == 0x99) { p[1] = 0x98; p++; continue; }
-//        if (p[0] == 0xD1 && p[1] == 0x91) { p[0] = 0xD0; p[1] = 0xB5; p++; continue; }
-//    }
-//}
-
-// ============================================================
 // Marquee renderer
 // ============================================================
 template <typename T>
@@ -1782,16 +1767,18 @@ static void draw_ui_impl(T& lcd) {
 				y += 28;
 			}
 
-			uint32_t now_upd = (uint32_t)(esp_timer_get_time() / 1000);
+            uint32_t now_upd = (uint32_t)(esp_timer_get_time() / 1000);
 
-			if (s_upd_refuse_ms != 0 && (now_upd - s_upd_refuse_ms) < 1500) {
-				lcd.setTextColor(TFT_RED);
-				lcd.drawString("Нет сети или идёт операция", 15, 216);
-			} else {
-				lcd.setTextColor(TFT_LIGHTGRAY);
-				lcd.drawString("A: Назад   B: Загрузить", 15, 216);
-			}
-			return;
+            if (s_upd_refuse_ms != 0 && (now_upd - s_upd_refuse_ms) < 1500) {
+                lcd.setTextColor(TFT_RED);
+                lcd.drawString("Нет сети или идёт операция", 15, 216);
+            } else {
+                lcd.setTextColor(TFT_DARKGREY);
+                lcd.drawString("Enc: выбрать источник", 15, 196);
+                lcd.setTextColor(TFT_LIGHTGRAY);
+                lcd.drawString("A: Назад   B: Загрузить", 15, 216);
+            }
+            return;
 		}
 	// 2. Если идет глубокая валидация
 	if (catalog_is_deep_validating()) {

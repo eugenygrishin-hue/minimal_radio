@@ -280,3 +280,9 @@ bool catalog_staging_add_station(uint32_t id,
                                  uint16_t bitrate,
                                  const char* group);
 
+/**
+ * Сканирует избранное и удаляет все записи, чей ID больше не существует
+ * в рабочем каталоге. Вызывается после любой операции удаления станций/категорий.
+ * Возвращает количество удалённых сирот.
+ */
+int catalog_cleanup_orphan_favorites(void);
