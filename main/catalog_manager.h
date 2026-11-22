@@ -266,3 +266,17 @@ catalog_merge_phase_t catalog_get_merge_phase(void);
 
 bool catalog_start_merge(void);
 
+// Удаляет i-ю запись избранного напрямую (работает и для «пенёчков»,
+// где станция уже отсутствует в каталоге). Возвращает true при успехе.
+bool catalog_remove_favorite_at_index(int fav_idx);
+
+/**
+ * Добавляет станцию в staging-буфер с дедупликацией по ID относительно staging.
+ * Возвращает true, если станция реально добавлена (не дубликат).
+ */
+bool catalog_staging_add_station(uint32_t id,
+                                 const char* name,
+                                 const char* url,
+                                 uint16_t bitrate,
+                                 const char* group);
+

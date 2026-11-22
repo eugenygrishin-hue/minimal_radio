@@ -6,6 +6,7 @@
 #include "ui_manager.h"
 #include "sd_manager.h"
 #include "catalog_manager.h"
+#include "catalog_updater.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -37,9 +38,27 @@ static bool g_sntp_started = false;
 
 static portMUX_TYPE g_wifi_test_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static int g_previous_station = 0;
+static int g_previous_station = -1;          // -1 = нет прошлой
 static uint64_t g_station_change_time_ms = 0;
 static bool g_rollback_handled = false;
+
+// E4-v1: ID станций с неподдерживаемым форматом (AAC+). Живут до перезагрузки.
+static uint32_t g_unsupported_ids[32];
+static int      g_unsupported_count = 0;
+
+static void remember_unsupported(uint32_t id) {
+    if (id == 0) return;
+    for (int i = 0; i < g_unsupported_count; i++)
+        if (g_unsupported_ids[i] == id) return;
+    if (g_unsupported_count < 32)
+        g_unsupported_ids[g_unsupported_count++] = id;
+}
+
+static bool is_unsupported_blacklisted(uint32_t id) {
+    for (int i = 0; i < g_unsupported_count; i++)
+        if (g_unsupported_ids[i] == id) return true;
+    return false;
+}
 
 // ============================================================
 // Station switch state machine (А2: fade + drain)
@@ -59,6 +78,53 @@ const uint32_t FADE_OUT_MS = 250;   // было 120
 const uint32_t FADE_IN_MS  = 600;   // было 120
 const uint32_t WAIT_DATA_TIMEOUT_MS = 6000; // было 5000, даём время на rebuffer
 static constexpr size_t   MIN_RING_FILL_FOR_FADE_IN = 8192;  // 8 KB минимум
+
+
+/**
+ * Сканирует каталог от start_from (включительно) по кругу,
+ * возвращает глобальный индекс первой станции со статусом != DEAD.
+ * Возвращает -1 если здоровых нет вообще.
+ */
+static int pick_first_healthy(int start_from) {
+    int total = (int)catalog_total_stations();
+    if (total <= 0) return -1;
+    if (start_from < 0) start_from = 0;
+    for (int i = 0; i < total; i++) {
+        int g = (start_from + i) % total;
+        const catalog_station_t* st = catalog_get_station_by_global_index(g);
+        if (st != nullptr &&
+            st->status != CAT_STATUS_DEAD &&
+            !is_unsupported_blacklisted(st->id)) {     // ← НОВОЕ
+            return g;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Fallback-логика: пробуем прошлую (если живая), иначе сканируем вперёд.
+ * Возвращает -1 если здоровых нет.
+ */
+static int pick_fallback_station(int current_gidx) {
+    // 1. Прошлая станция, если живая и не та же самая
+    if (g_previous_station >= 0 && g_previous_station != current_gidx) {
+        const catalog_station_t* st =
+            catalog_get_station_by_global_index(g_previous_station);
+        if (st != nullptr && st->status != CAT_STATUS_DEAD) {
+            int p = g_previous_station;
+            g_previous_station = -1;  // один раз, против пинг-понга
+            return p;
+        }
+        g_previous_station = -1;
+    }
+    // 2. Сканируем вперёд от текущей
+    int g = pick_first_healthy(current_gidx + 1);
+    if (g >= 0 && g != current_gidx) return g;
+    // 3. Сканируем с начала
+    g = pick_first_healthy(0);
+    if (g >= 0 && g != current_gidx) return g;
+    return -1;
+}
 
 static const char* get_station_url_from_catalog(int index) {
     const catalog_station_t* st = catalog_get_station_by_global_index(index);
@@ -297,6 +363,24 @@ extern "C" void app_main(void)
         }
     }
 
+    // E2: если восстановленная станция DEAD — ищем первую здоровую
+    {
+        const catalog_station_t* restored =
+            catalog_get_station_by_global_index(g_selected_station);
+        if (restored != nullptr && restored->status == CAT_STATUS_DEAD) {
+            ESP_LOGW(TAG, "Restored station %d is DEAD, picking first healthy",
+                     g_selected_station);
+            int healthy = pick_first_healthy(0);
+            if (healthy >= 0) {
+                g_selected_station = healthy;
+                ESP_LOGI(TAG, "Boot fallback: station %d", g_selected_station);
+            } else {
+                ESP_LOGE(TAG, "No healthy stations at boot!");
+                g_selected_station = -1;
+            }
+        }
+    }
+
     // 5. Подключение Wi-Fi
     boot_draw(80, "Connecting Wi-Fi...");
     wifi_known_networks_load();
@@ -324,10 +408,14 @@ extern "C" void app_main(void)
     // 7. HTTP stream
     boot_draw(95, "Stream...");
     http_stream_init(ringbuf);
-    const catalog_station_t* st_init =
-        catalog_get_station_by_global_index(g_selected_station);
-    http_stream_start(get_station_url_from_catalog(g_selected_station),
-                      st_init ? st_init->id : 0);
+    if (g_selected_station >= 0) {
+        const catalog_station_t* st_init =
+            catalog_get_station_by_global_index(g_selected_station);
+        http_stream_start(get_station_url_from_catalog(g_selected_station),
+                          st_init ? st_init->id : 0);
+    } else {
+        ESP_LOGW(TAG, "No station to start, stream remains idle");
+    }
 
     boot_draw(100, "Ready!");
     vTaskDelay(pdMS_TO_TICKS(300));  // короткая пауза, чтобы "Ready!" мигнул
@@ -384,6 +472,15 @@ extern "C" void app_main(void)
             }
 
             case SWITCH_WAITING_DATA: {
+                // === НОВОЕ: ранний выход при unsupported/failed ===
+                if (http_stream_is_unsupported() || http_stream_is_failed()) {
+                    ESP_LOGW(TAG, "Stream dead during WAIT, skipping timeout");
+                    audio_output_set_fade_factor(256);
+                    g_switch_phase = SWITCH_IDLE;
+                    g_switch_target_station = -1;
+                    break;
+                }
+                // ====================================================
                 // Fade in запускаем только когда decode_task вышел из rebuffering
                 // и реально начал выводить PCM. Иначе factor застынет/таймаутится.
                 if (audio_player_is_outputting()) {
@@ -426,44 +523,102 @@ extern "C" void app_main(void)
         ui_update();
 
         // ============================================================
-        // Auto-rollback: только когда нет активного переключения
+        // E3: Stream-failure fallback (заменяет старый Auto-rollback)
         // ============================================================
-        if (!catalog_is_merging() && g_switch_phase == SWITCH_IDLE) {
-            const catalog_station_t* current_st =
-                catalog_get_station_by_global_index(g_selected_station);
+        if (!catalog_is_merging() && g_switch_phase == SWITCH_IDLE &&
+                !catalog_updater_is_busy()) {
 
-            if (current_st != nullptr &&
-                current_st->status == CAT_STATUS_DEAD &&
-                !g_rollback_handled) {
+        	bool stream_failed    = http_stream_is_failed();
+        	bool stream_unsupp    = http_stream_is_unsupported();
 
-                uint64_t now_ms = esp_timer_get_time() / 1000;
+        	// Путь A: поток сдался (мертв) ИЛИ формат неподдерживаемый (AAC+)
+        	if (stream_failed || stream_unsupp) {
+        	    http_stream_clear_failed();
 
-                if (now_ms - g_station_change_time_ms < 45000) {
-                    const catalog_station_t* prev_st =
-                        catalog_get_station_by_global_index(g_previous_station);
+        	    const catalog_station_t* cur_bad =
+        	        catalog_get_station_by_global_index(g_selected_station);
+        	    uint32_t bad_id = cur_bad ? cur_bad->id : 0;
 
-                    if (g_previous_station >= 0 &&
-                        prev_st != nullptr &&
-                        prev_st->status == CAT_STATUS_ALIVE) {
+        	    if (stream_unsupp) {
+        	        // читаем reason ДО clear (clear обнуляет строку)
+        	        char reason[16];
+        	        strncpy(reason, http_stream_get_unsupported_reason(), sizeof(reason) - 1);
+        	        reason[sizeof(reason) - 1] = '\0';
+        	        http_stream_clear_unsupported();
 
-                        ESP_LOGW(TAG,
-                                 "Station died quickly, rolling back to healthy previous: %d",
-                                 g_previous_station);
+        	        remember_unsupported(bad_id);
 
-                        g_selected_station = g_previous_station;
-                        g_station_change_time_ms = now_ms;
-                        storage_save_station(g_selected_station);
-                        if (prev_st != nullptr) {
-                            storage_save_last_station_id(prev_st->id);   // ← НОВОЕ
+        	        ESP_LOGW(TAG, "Station %d (%s) format %s unsupported by MP3 decoder, "
+        	                      "blacklisted for session",
+        	                 g_selected_station,
+        	                 cur_bad ? cur_bad->name : "?",
+        	                 reason[0] ? reason : "?");
+        	    }
+
+        	    ESP_LOGW(TAG, "Stream gave up on station %d, searching fallback...",
+        	             g_selected_station);
+
+        	    int fb = pick_fallback_station(g_selected_station);
+
+                if (fb >= 0) {
+                    const catalog_station_t* fb_st =
+                        catalog_get_station_by_global_index(fb);
+
+                    g_selected_station = fb;
+                    g_station_change_time_ms = esp_timer_get_time() / 1000;
+                    g_rollback_handled = false;
+                    storage_save_station(g_selected_station);
+                    if (fb_st) storage_save_last_station_id(fb_st->id);
+
+                    http_stream_start(get_station_url_from_catalog(fb),
+                                      fb_st ? fb_st->id : 0);
+
+                    ESP_LOGI(TAG, "Fallback: switched to station %d (%s)",
+                             fb, fb_st ? fb_st->name : "?");
+                } else {
+                    ESP_LOGE(TAG, "No healthy stations available, going idle");
+                    http_stream_stop();
+                    g_selected_station = -1;
+                }
+            }
+            // Путь B: станция помечена DEAD, но поток ещё крутится (старый rollback, упрощённый)
+            else {
+                const catalog_station_t* current_st =
+                    catalog_get_station_by_global_index(g_selected_station);
+
+                if (current_st != nullptr &&
+                    current_st->status == CAT_STATUS_DEAD &&
+                    !g_rollback_handled) {
+
+                    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+                    if (now_ms - g_station_change_time_ms < 45000) {
+                        int fb = pick_fallback_station(g_selected_station);
+
+                        if (fb >= 0) {
+                            const catalog_station_t* fb_st =
+                                catalog_get_station_by_global_index(fb);
+
+                            ESP_LOGW(TAG,
+                                     "Station %d marked DEAD, falling back to %d (%s)",
+                                     g_selected_station, fb,
+                                     fb_st ? fb_st->name : "?");
+
+                            g_selected_station = fb;
+                            g_station_change_time_ms = now_ms;
+                            storage_save_station(g_selected_station);
+                            if (fb_st) storage_save_last_station_id(fb_st->id);
+
+                            http_stream_start(get_station_url_from_catalog(fb),
+                                              fb_st ? fb_st->id : 0);
+                        } else {
+                            ESP_LOGW(TAG, "All stations DEAD, stopping playback");
+                            http_stream_stop();
+                            g_selected_station = -1;
                         }
-                        http_stream_start(get_station_url_from_catalog(g_selected_station), prev_st->id);
-                    } else {
-                        ESP_LOGW(TAG,
-                                 "Station died, but previous station is unhealthy/invalid. Stopping playback.");
-                        http_stream_stop();
-                    }
 
-                    g_rollback_handled = true;
+                        g_rollback_handled = true;
+                    }
                 }
             }
         }
@@ -483,7 +638,8 @@ extern "C" void app_main(void)
             !http_stream_is_running() &&
             !wifi_is_testing() &&
             !g_wifi_reconnect_in_progress &&
-            g_switch_phase == SWITCH_IDLE) {
+            g_switch_phase == SWITCH_IDLE &&
+		    !catalog_updater_is_busy()) {
 
             ESP_LOGI(TAG, "Stream stopped, performing Wi-Fi reconnect");
             wifi_reconnect(g_wifi_ssid, g_wifi_pass);
@@ -536,7 +692,8 @@ extern "C" void app_main(void)
             !g_wifi_test_active &&
             !g_wifi_reconnect_in_progress &&
             !g_wifi_pending_reconnect &&
-            !http_stream_is_running()) {
+            !http_stream_is_running() &&
+		    !catalog_updater_is_busy()) {
 
             ESP_LOGI(TAG, "Restarting stream after successful Wi-Fi test");
 
@@ -584,6 +741,8 @@ extern "C" void app_main(void)
             starve,
             overflow
         );
+
+        ui_set_playing_station(g_selected_station);   // E5
 
         ui_set_stream_meta(
             http_stream_get_icy_name(),

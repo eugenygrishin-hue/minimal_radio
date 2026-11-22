@@ -116,3 +116,9 @@ void ui_set_current_mode(ui_mode_t mode);
 
 void ui_set_switch_phase(int phase);
 
+/**
+ * E5: main loop вызывает каждый цикл рядом с ui_set_playback_info.
+ * Глобальный индекс играющей станции (-1 = idle / нет станции).
+ */
+void ui_set_playing_station(int global_index);
+

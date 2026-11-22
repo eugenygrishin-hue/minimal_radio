@@ -5,6 +5,7 @@
 
 #include "audio_player.h"
 #include "audio_output.h"
+#include "catalog_updater.h"
 
 #include "font_cyr_8x16.h"
 
@@ -125,6 +126,16 @@ static int s_new_volume = 0;
 
 static ui_mode_t s_current_mode = MODE_PLAYBACK;
 
+static int s_catalog_submode = 0;   // 0=меню, 1=выбор источника
+static int s_upd_source_idx  = 0;   // индекс выбранного источника в s_sources
+static uint32_t s_upd_refuse_ms = 0;
+static uint32_t s_cat_saved_ms = 0;   // тост «Сохранено» после удаления категорий
+
+// E5: избранное из PLAY
+static int      s_playing_station_gidx = -1;
+static uint32_t s_fav_toast_ms   = 0;
+static char     s_fav_toast_text[32] = "";
+
 typedef enum {
     KB_TARGET_NONE = 0,
     KB_TARGET_SSID,
@@ -141,9 +152,6 @@ static bool s_use_sprite = false;
 
 // Если нужно временно отключить спрайт — поставь true
 static const bool SPRITE_DEBUG_FORCE_DIRECT = false;
-
-
-
 
 // ============================================================
 // Чтение HMI
@@ -291,6 +299,49 @@ static int draw_cyr_str(T& lcd, int x, int y, const char* utf8, uint16_t color)
         }
 
         lcd.pushImage(x, y, CYR_FONT_W, CYR_FONT_H, s_glyph_rgb);
+        x += CYR_FONT_W;
+    }
+
+    return x;
+}
+
+/**
+ * То же, что draw_cyr_str, но с ПРОЗРАЧНЫМ фоном:
+ * выключенные пиксели глифа НЕ пишутся, поэтому текст можно
+ * накладывать поверх цветных полос (progress / flow / val).
+ * Возвращает итоговый x.
+ */
+template <typename T>
+static int draw_cyr_str_trans(T& lcd, int x, int y, const char* utf8, uint16_t color)
+{
+    if (!utf8) return x;
+
+    const char* p = utf8;
+
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        int gi = cyr_font_lookup(cp);
+
+        if (gi < 0) {
+            gi = cyr_font_lookup('?');
+        }
+
+        if (gi < 0) {
+            x += CYR_FONT_W;
+            continue;
+        }
+
+        const uint8_t* gdata = cyr_font_data[gi];
+
+        for (int row = 0; row < CYR_FONT_H; row++) {
+            uint8_t bits = gdata[row * CYR_FONT_RB];
+            for (int col = 0; col < CYR_FONT_W; col++) {
+                if (bits & (0x80 >> col)) {          // рисуем ТОЛЬКО «включённые» пиксели
+                    lcd.drawPixel(x + col, y + row, color);
+                }
+            }
+        }
+
         x += CYR_FONT_W;
     }
 
@@ -1048,7 +1099,9 @@ static void draw_flow_bar(T& lcd, int x, int y, int w, int h,
             marker_color = 0xFFE0;
         }
 
-        lcd.fillRoundRect(mx, y + 3, marker_w, h - 6, 2, marker_color);
+        lcd.fillRoundRect(mx - 1, y + 2, marker_w + 2, h - 4, 3, TFT_BLACK);  // обводка
+        lcd.fillRoundRect(mx,     y + 3, marker_w,     h - 6, 2, marker_color); // сам маркер
+        //lcd.fillRoundRect(mx, y + 3, marker_w, h - 6, 2, marker_color);
     }
 
     // Мигающая рамка при starve
@@ -1261,7 +1314,7 @@ static void draw_ui_impl(T& lcd) {
 
                 if (i == s_settings_idx) {
                     lcd.setTextColor(TFT_BLACK);
-                    lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                    lcd.fillRoundRect(5, y - 2, 310, 20, 4, 0x07E0);
                 } else {
                     lcd.setTextColor(TFT_WHITE);
                 }
@@ -1297,15 +1350,27 @@ static void draw_ui_impl(T& lcd) {
         int y = 68;
         if (fav_count == 0) {
             lcd.setTextColor(TFT_LIGHTGRAY);
+            // Нижняя подсказка: долгим нажатием удаляем (в т.ч. «пенёчки»)
             lcd.setFont(&fonts::efontCN_14);
-            lcd.drawString("Список пуст", 15, y);
-            lcd.drawString("Долгое нажатие в STA", 15, y + 24);
-            lcd.drawString("добавит станцию", 15, y + 48);
+            lcd.setTextColor(TFT_DARKGREY);
+            lcd.drawString("Enc-long: удалить (вкл. [удалено])", 15, 216);
         } else {
             for (int i = start_idx; i < fav_count && i < start_idx + visible_items; i++) {
                 int global_idx = catalog_get_favorite_global_index(i);
                 const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
-                if (st == nullptr) continue; // Станция могла быть удалена из каталога
+                if (st == nullptr) {
+                    // Станция удалена из каталога — рисуем заглушку, чтобы y не «прыгал»
+                    if (i == s_fav_station_idx) {
+                        lcd.setTextColor(TFT_BLACK);
+                        lcd.fillRoundRect(5, y - 5, 310, 24, 4, TFT_DARKGREY);
+                    } else {
+                        lcd.setTextColor(TFT_DARKGREY);
+                    }
+                    lcd.setFont(&fonts::efontCN_14);
+                    lcd.drawString("[удалено]", 15, y);
+                    y += 28;
+                    continue;
+                } // Станция могла быть удалена из каталога
                 // --- Обработка статуса для избранного ---
                 char fav_display_name[128];
                 uint16_t base_color = TFT_WHITE;
@@ -1348,7 +1413,7 @@ static void draw_ui_impl(T& lcd) {
         for (int i = 0; i < count; i++) {
             if (i == s_settings_idx) {
                 lcd.setTextColor(TFT_BLACK);
-                lcd.fillRoundRect(5, y - 5, 310, 26, 4, 0x07E0);
+                lcd.fillRoundRect(5, y - 2, 310, 20, 4, 0x07E0);
             } else {
                 lcd.setTextColor(TFT_WHITE);
             }
@@ -1457,140 +1522,372 @@ static void draw_ui_impl(T& lcd) {
     // Catalog Management (Финальная версия с прогресс-баром)
     // ========================================================
 
-    else if (s_current_mode == MODE_CATALOG) {
-        lcd.setFont(&fonts::efontCN_14);
-        lcd.setTextColor(0x07E0);
-        lcd.drawString("Управление каталогом", 10, 48);
+	else if (s_current_mode == MODE_CATALOG) {
+		lcd.setFont(&fonts::efontCN_14);
+		lcd.setTextColor(0x07E0);
+		lcd.drawString("Управление каталогом", 10, 48);
 
-        // 1. Если идет слияние (Merge), показываем прогресс
-        if (catalog_is_merging()) {
-            catalog_merge_phase_t phase = catalog_get_merge_phase();
-            int pct = catalog_get_merge_progress();
+		// 1. Если идет слияние (Merge), показываем прогресс
+		if (catalog_is_merging()) {
 
-            static uint32_t last_log_ms = 0;
-            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+			catalog_merge_phase_t phase = catalog_get_merge_phase();
+			int pct = catalog_get_merge_progress();
 
-            if (now_ms - last_log_ms > 1000) {
-                last_log_ms = now_ms;
-                ESP_LOGI("UI_DRAW", "Merge draw active, pct=%d", pct);
-            }
+			static uint32_t last_log_ms = 0;
+			uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-            const char* msg = "Слияние каталога...";
+			if (now_ms - last_log_ms > 1000) {
+				last_log_ms = now_ms;
+				ESP_LOGI("UI_DRAW", "Merge draw active, pct=%d", pct);
+			}
 
-            if (phase == CATALOG_MERGE_PHASE_SAVE) {
-                msg = "Сохранение каталога на SD...";
-            } else if (phase == CATALOG_MERGE_PHASE_DONE) {
-                msg = "Завершение...";
-            }
+			const char *msg = "Слияние каталога...";
 
-            lcd.setFont(&fonts::efontCN_14);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString(msg, 15, 80);
+			if (phase == CATALOG_MERGE_PHASE_SAVE) {
+				msg = "Сохранение каталога на SD...";
+			} else if (phase == CATALOG_MERGE_PHASE_DONE) {
+				msg = "Завершение...";
+			}
 
-            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+			lcd.setFont(&fonts::efontCN_14);
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString(msg, 15, 80);
 
-            int bar_w = (290 * pct) / 100;
-            if (bar_w > 0) {
-                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
-            }
+			lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
 
-            char buf[48];
-            snprintf(buf, sizeof(buf), "%d%%", pct);
+			int bar_w = (290 * pct) / 100;
+			if (bar_w > 0) {
+				lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+			}
 
-            lcd.setTextDatum(MC_DATUM);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString(buf, 160, 122);
-            lcd.setTextDatum(TL_DATUM);
+			char buf[48];
+			snprintf(buf, sizeof(buf), "%d%%", pct);
 
-            lcd.setTextColor(TFT_LIGHTGRAY);
-            lcd.drawString("Радио продолжает играть...", 15, 150);
+			lcd.setTextDatum(MC_DATUM);
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString(buf, 160, 122);
+			lcd.setTextDatum(TL_DATUM);
 
-            return;
-        }
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString("Радио продолжает играть...", 15, 150);
 
-        // 2. Если идет глубокая валидация
-        if (catalog_is_deep_validating()) {
-            int done = catalog_get_deep_validated_count();
-            int total = catalog_get_suspect_count() + done;
-            if (total == 0) total = 1;
-            int pct = (done * 100) / total;
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString("Глубокая проверка SUSPECT...", 15, 80);
-            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
-            int bar_w = (290 * pct) / 100;
-            if (bar_w > 0) {
-                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
-            }
-            char buf[48];
-            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
-            lcd.setTextDatum(MC_DATUM);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString(buf, 160, 122);
-            lcd.setTextDatum(TL_DATUM);
-            lcd.setTextColor(TFT_LIGHTGRAY);
-            lcd.drawString("Можно слушать радио...", 15, 150);
-            return;
-        }
+			return;
+		}
+		catalog_updater_phase_t uph = catalog_updater_get_phase();
 
-        // 3. Если идет обычная валидация
-        if (catalog_is_validating()) {
-            int done = catalog_get_validated_count();
-            int total = catalog_get_staging_count();
-            int pct = (total > 0) ? (done * 100 / total) : 0;
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString("Проверка живых станций...", 15, 80);
-            lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
-            int bar_w = (290 * pct) / 100;
-            if (bar_w > 0) {
-                lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
-            }
-            char buf[48];
-            snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
-            lcd.setTextDatum(MC_DATUM);
-            lcd.setTextColor(TFT_WHITE);
-            lcd.drawString(buf, 160, 122);
-            lcd.setTextDatum(TL_DATUM);
-            lcd.setTextColor(TFT_LIGHTGRAY);
-            lcd.drawString("Можно слушать радио...", 15, 150);
-            return;
-        }
+		// ---- Экраны апдейтера (приоритет над меню) ----
+		if (uph == UPD_DOWNLOADING) {
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString("Загрузка каталога...", 15, 80);
 
-        // 4. Обычное меню (строго синхронизировано с обработчиком ниже!)
-        lcd.setFont(&fonts::efontCN_14);
-        lcd.setTextColor(TFT_WHITE);
+			const upd_source_t *srcs = NULL;
+			int nsrc = 0;
+			srcs = catalog_updater_get_sources(&nsrc);
+			if (s_upd_source_idx < nsrc) {
+				lcd.setTextColor(TFT_LIGHTGRAY);
+				lcd.drawString(srcs[s_upd_source_idx].url, 15, 100);
+			}
 
-        int staging_count = catalog_get_staging_count();
-        int alive_count = catalog_get_alive_count();
-        int suspect_count = catalog_get_suspect_count();
-        int dead_count = catalog_get_dead_count();
+			size_t dl = catalog_updater_get_bytes_downloaded();
+			size_t tot = catalog_updater_get_bytes_total();
+			int pct = catalog_updater_get_progress();
 
-        char line[96];
-        snprintf(line, sizeof(line), "В буфере: %d (A:%d S:%d D:%d)",
-                 staging_count, alive_count, suspect_count, dead_count);
-        lcd.drawString(line, 15, 68); // Подняли выше
+			lcd.drawRoundRect(15, 130, 290, 24, 6, TFT_DARKGREY);
+			int bw = (290 * pct) / 100;
+			if (bw > 0)
+				lcd.fillRoundRect(15, 130, bw, 24, 6, 0x07E0);
 
-        int y = 88; // Подняли начало меню
-        const char* items[] = {
-            "1. Импортировать M3U с SD",          // index 0
-            "2. Проверить живые (Fast)",          // index 1
-            "3. Глубоко проверить SUSPECT",       // index 2
-            "4. Применить изменения (Merge)",     // index 3
-            "5. Зачистить мертвые станции",       // index 4
-            "6. Назад"                            // index 5
-        };
-        int count = 6;
+			char buf[48];
+			snprintf(buf, sizeof(buf), "%u / %u KB (%d%%)",
+					(unsigned) (dl / 1024), (unsigned) (tot / 1024), pct);
+			lcd.setTextDatum(MC_DATUM);
 
-        for (int i = 0; i < count; i++) {
-            if (i == s_settings_idx) {
-                lcd.setTextColor(TFT_BLACK);
-                lcd.fillRoundRect(5, y - 4, 310, 24, 4, 0x07E0);
-            } else {
-                lcd.setTextColor(TFT_WHITE);
-            }
-            lcd.drawString(items[i], 15, y);
-            y += 24;
-        }
-    }
+			// Тень
+			lcd.setTextColor(TFT_BLACK);
+			lcd.drawString(buf, 161, 143);
+
+			// Текст
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString(buf, 160, 142);
+			lcd.setTextDatum(TL_DATUM);
+			return;
+		} else if (uph == UPD_CONVERTING) {
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString("Конвертация SII → M3U...", 15, 80);
+			char buf[48];
+			snprintf(buf, sizeof(buf), "Станций: %d",
+					catalog_updater_get_stations_parsed());
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString(buf, 15, 110);
+			return;
+		} else if (uph == UPD_IMPORTING) {
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString("Импорт в staging...", 15, 80);
+			return;
+		} else if (uph == UPD_ASK_VALIDATE) {
+			lcd.setTextColor(TFT_WHITE);
+			char buf[64];
+			snprintf(buf, sizeof(buf), "Загружено: %d станций",
+					catalog_updater_get_stations_parsed());
+			lcd.drawString(buf, 15, 80);
+
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString("Проверить перед применением?", 15, 110);
+
+			lcd.setTextColor(0x07E0);
+			lcd.drawString("A: Применить сразу", 15, 150);
+			lcd.drawString("B: Проверить", 15, 175);
+			lcd.setTextColor(TFT_DARKGREY);
+			char hint[64];
+			snprintf(hint, sizeof(hint), "(Проверка ~%d станций, долго)",
+					catalog_updater_get_stations_parsed());
+			lcd.drawString(hint, 15, 198);
+
+			return;
+		} else if (uph == UPD_VALIDATING) {
+			// Переиспользуем существующий validation-экран
+			int done = catalog_get_validated_count();
+			int total = catalog_get_staging_count();
+			int pct = (total > 0) ? (done * 100 / total) : 0;
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString("Проверка живых станций...", 15, 80);
+			lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+			int bw = (290 * pct) / 100;
+			if (bw > 0)
+				lcd.fillRoundRect(15, 110, bw, 24, 6, 0x07E0);
+			char buf[48];
+			snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+			lcd.setTextDatum(MC_DATUM);
+
+			// Тень
+			lcd.setTextColor(TFT_BLACK);
+			lcd.drawString(buf, 161, 123);
+
+			// Текст
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString(buf, 160, 122);
+			lcd.setTextDatum(TL_DATUM);
+			return;
+		} else if (uph == UPD_MERGING) {
+			catalog_merge_phase_t phase = catalog_get_merge_phase();
+			int pct = catalog_get_merge_progress();
+
+			const char *msg = "Слияние каталога...";
+			if (phase == CATALOG_MERGE_PHASE_SAVE) {
+				msg = "Сохранение каталога на SD...";
+			} else if (phase == CATALOG_MERGE_PHASE_DONE) {
+				msg = "Завершение...";
+			}
+
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString(msg, 15, 80);
+
+			lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+
+			int bar_w = (290 * pct) / 100;
+			if (bar_w > 0) {
+				lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+			}
+
+			char buf[48];
+			snprintf(buf, sizeof(buf), "%d%%", pct);
+
+			lcd.setTextDatum(MC_DATUM);
+			lcd.setTextColor(TFT_WHITE);
+
+			// Тень
+			lcd.setTextColor(TFT_BLACK);
+			lcd.drawString(buf, 161, 123);
+
+			// Текст
+			lcd.drawString(buf, 160, 122);
+			lcd.setTextDatum(TL_DATUM);
+
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString("Радио продолжает играть...", 15, 150);
+
+			return;
+		} else if (uph == UPD_DONE) {
+			updater_result_t res;
+			catalog_updater_get_result(&res);
+
+			bool nothing_changed = (res.added == 0 && res.updated == 0
+					&& res.removed == 0);
+
+			if (nothing_changed) {
+				lcd.setTextColor(TFT_LIGHTGRAY);
+				lcd.drawString("Каталог актуален", 15, 80);
+
+				lcd.setTextColor(TFT_WHITE);
+
+				char buf[80];
+				snprintf(buf, sizeof(buf), "Проверено: %d станций из источника",
+						res.staging_count);
+				lcd.drawString(buf, 15, 105);
+
+				snprintf(buf, sizeof(buf),
+						"Все уже есть в каталоге (%d станций)",
+						res.total_after);
+				lcd.drawString(buf, 15, 125);
+			} else {
+				lcd.setTextColor(0x07E0);
+				lcd.drawString("Каталог обновлён!", 15, 80);
+
+				lcd.setTextColor(TFT_WHITE);
+
+				char buf[80];
+				snprintf(buf, sizeof(buf), "Было: %d   Стало: %d",
+						res.total_before, res.total_after);
+				lcd.drawString(buf, 15, 110);
+
+				snprintf(buf, sizeof(buf),
+						"Добавлено: %d  Обновлено: %d  Удалено: %d", res.added,
+						res.updated, res.removed);
+				lcd.drawString(buf, 15, 135);
+			}
+
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString("A: ОК", 15, 180);
+			return;
+		} else if (uph == UPD_ERROR) {
+			lcd.setTextColor(TFT_RED);
+			lcd.drawString("Ошибка обновления", 15, 80);
+			lcd.setTextColor(TFT_LIGHTGRAY);
+			lcd.drawString(catalog_updater_get_error(), 15, 110);
+			lcd.drawString("A: ОК", 15, 180);
+			return;
+		}
+
+		// ---- Подменю выбора источника (s_catalog_submode == 1) ----
+		if (s_catalog_submode == 1) {
+			const upd_source_t *srcs = NULL;
+			int nsrc = 0;
+			srcs = catalog_updater_get_sources(&nsrc);
+
+			lcd.setTextColor(TFT_WHITE);
+			lcd.drawString("Выберите источник:", 15, 70);
+
+			int y = 100;
+			for (int i = 0; i < nsrc; i++) {
+				if (i == s_upd_source_idx) {
+					lcd.setTextColor(TFT_BLACK);
+					lcd.fillRoundRect(5, y - 4, 310, 24, 4, 0x07E0);
+				} else {
+					lcd.setTextColor(TFT_WHITE);
+				}
+				char line[64];
+				snprintf(line, sizeof(line), "%s (%s)", srcs[i].label,
+						srcs[i].cc);
+				lcd.drawString(line, 15, y);
+				y += 28;
+			}
+
+			uint32_t now_upd = (uint32_t)(esp_timer_get_time() / 1000);
+
+			if (s_upd_refuse_ms != 0 && (now_upd - s_upd_refuse_ms) < 1500) {
+				lcd.setTextColor(TFT_RED);
+				lcd.drawString("Нет сети или идёт операция", 15, 216);
+			} else {
+				lcd.setTextColor(TFT_LIGHTGRAY);
+				lcd.drawString("A: Назад   B: Загрузить", 15, 216);
+			}
+			return;
+		}
+	// 2. Если идет глубокая валидация
+	if (catalog_is_deep_validating()) {
+		int done = catalog_get_deep_validated_count();
+		int total = catalog_get_suspect_count() + done;
+		if (total == 0)
+			total = 1;
+		int pct = (done * 100) / total;
+		lcd.setTextColor(TFT_WHITE);
+		lcd.drawString("Глубокая проверка SUSPECT...", 15, 80);
+		lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+		int bar_w = (290 * pct) / 100;
+		if (bar_w > 0) {
+			lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+		}
+		char buf[48];
+		snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+		lcd.setTextDatum(MC_DATUM);
+		lcd.setTextColor(TFT_WHITE);
+		lcd.drawString(buf, 160, 122);
+		lcd.setTextDatum(TL_DATUM);
+		lcd.setTextColor(TFT_LIGHTGRAY);
+		lcd.drawString("Можно слушать радио...", 15, 150);
+		return;
+	}
+
+	// 3. Если идет обычная валидация
+	if (catalog_is_validating()) {
+		int done = catalog_get_validated_count();
+		int total = catalog_get_staging_count();
+		int pct = (total > 0) ? (done * 100 / total) : 0;
+		lcd.setTextColor(TFT_WHITE);
+		lcd.drawString("Проверка живых станций...", 15, 80);
+		lcd.drawRoundRect(15, 110, 290, 24, 6, TFT_DARKGREY);
+		int bar_w = (290 * pct) / 100;
+		if (bar_w > 0) {
+			lcd.fillRoundRect(15, 110, bar_w, 24, 6, 0x07E0);
+		}
+		char buf[48];
+		snprintf(buf, sizeof(buf), "%d / %d (%d%%)", done, total, pct);
+		//lcd.setTextDatum(MC_DATUM);
+		//lcd.setTextColor(TFT_WHITE);
+		//lcd.drawString(buf, 160, 122);
+		//lcd.setTextDatum(TL_DATUM);
+
+		lcd.setTextDatum(MC_DATUM);
+
+		// Тень
+		lcd.setTextColor(TFT_BLACK);
+		lcd.drawString(buf, 161, 123);
+
+		// Текст
+		lcd.setTextColor(TFT_WHITE);
+		lcd.drawString(buf, 160, 122);
+
+		lcd.setTextDatum(TL_DATUM);
+
+		lcd.setTextColor(TFT_LIGHTGRAY);
+		lcd.drawString("Можно слушать радио...", 15, 150);
+		return;
+	}
+
+		// 4. Обычное меню (строго синхронизировано с обработчиком ниже!)
+		lcd.setFont(&fonts::efontCN_14);
+		lcd.setTextColor(TFT_WHITE);
+
+		int staging_count = catalog_get_staging_count();
+		int alive_count = catalog_get_alive_count();
+		int suspect_count = catalog_get_suspect_count();
+		int dead_count = catalog_get_dead_count();
+
+		char line[96];
+		snprintf(line, sizeof(line), "В буфере: %d (A:%d S:%d D:%d)",
+				staging_count, alive_count, suspect_count, dead_count);
+		lcd.drawString(line, 15, 68); // Подняли выше
+
+		int y = 84; // Подняли начало меню
+		const char *items[] = { "1. Импортировать M3U с SD",          // index 0
+				"2. Проверить живые (Fast)",          // index 1
+				"3. Глубоко проверить SUSPECT",       // index 2
+				"4. Применить изменения (Merge)",     // index 3
+				"5. Зачистить мертвые станции",       // index 4
+				"6. Обновить из сети",                // index 5
+				"7. Назад" };
+		int count = 7;
+		for (int i = 0; i < count; i++) {
+			if (i == s_settings_idx) {
+				lcd.setTextColor(TFT_BLACK);
+				lcd.fillRoundRect(5, y - 3, 310, 22, 4, 0x07E0); // было y-4 / h=24
+			} else {
+				lcd.setTextColor(TFT_WHITE);
+			}
+			lcd.drawString(items[i], 15, y);
+			y += 22;                       // было 24
+		}
+	}
 
     // ========================================================
     // Playback
@@ -1740,9 +2037,16 @@ static void draw_ui_impl(T& lcd) {
                 //lcd.drawString(vbuf, PLAY_MX + PLAY_W / 2, PLAY_Y_FLOW + 8);
                 //lcd.setTextDatum(TL_DATUM);
 
+                //{
+                //    int vw = (int)strlen(vbuf) * CYR_FONT_W;
+                //    draw_cyr_str_trans(lcd, PLAY_MX + (PLAY_W - vw) / 2, PLAY_Y_FLOW, vbuf, TFT_WHITE);
+                //}
                 {
                     int vw = (int)strlen(vbuf) * CYR_FONT_W;
-                    draw_cyr_str(lcd, PLAY_MX + (PLAY_W - vw) / 2, PLAY_Y_FLOW + 1, vbuf, TFT_WHITE);
+                    int tx = PLAY_MX + (PLAY_W - vw) / 2;
+                    int ty = PLAY_Y_FLOW;
+                    draw_cyr_str_trans(lcd, tx + 1, ty + 1, vbuf, TFT_BLACK);   // тень
+                    draw_cyr_str_trans(lcd, tx,     ty,     vbuf, TFT_WHITE);   // текст
                 }
 
             } else {
@@ -1812,7 +2116,20 @@ static void draw_ui_impl(T& lcd) {
         //lcd.setTextColor(TFT_DARKGREY);
         //lcd.drawString("A:Play  B:Mode  Enc:Vol", PLAY_MX, PLAY_Y_HINT);
 
-        draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT, "A:Play  B:Mode  Enc:Vol", TFT_DARKGREY);
+        //draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT, "A:Play  B:Mode  Enc:Vol", TFT_DARKGREY);
+
+        // E5: тост избранного (2 с) поверх подсказки
+        {
+            uint32_t now_fav = (uint32_t)(esp_timer_get_time() / 1000);
+            if (s_fav_toast_ms != 0 && (now_fav - s_fav_toast_ms) < 2000) {
+                draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT,
+                             s_fav_toast_text, 0x07E0);
+            } else {
+                draw_cyr_str(lcd, PLAY_MX, PLAY_Y_HINT,
+                             "A:Play B:Mode Enc:Vol Long:Fav",
+                             TFT_DARKGREY);
+            }
+        }
 
         return;
     }
@@ -1888,6 +2205,13 @@ static void draw_ui_impl(T& lcd) {
                 lcd.drawString(label, 15, y);
             }
             y += 32;
+        }
+        // Тост «Сохранено» после удаления
+        uint32_t now_cat = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_cat_saved_ms != 0 && (now_cat - s_cat_saved_ms) < 2000) {
+            lcd.setFont(&fonts::efontCN_14);
+            lcd.setTextColor(0x07E0);
+            lcd.drawString("Сохранено на SD", 15, 216);
         }
     }
 
@@ -2010,6 +2334,12 @@ static void draw_ui_impl(T& lcd) {
 
             y += 28;
             visible_drawn++;
+        }
+        uint32_t now_sta = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_cat_saved_ms != 0 && (now_sta - s_cat_saved_ms) < 2000) {
+            lcd.setFont(&fonts::efontCN_14);
+            lcd.setTextColor(0x07E0);
+            lcd.drawString("Сохранено на SD", 15, 216);
         }
     }
 
@@ -2201,6 +2531,30 @@ void ui_update() {
         return;
     }
 
+    // ============================================================
+    // Принудительная перерисовка во время catalog_updater
+    // ============================================================
+    catalog_updater_phase_t uph = catalog_updater_get_phase();
+
+    if (uph != UPD_IDLE &&
+        uph != UPD_DONE &&
+        uph != UPD_ERROR &&
+        uph != UPD_ASK_VALIDATE) {
+
+        static uint32_t s_last_upd_draw_ms = 0;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (s_last_upd_draw_ms == 0 || (now_ms - s_last_upd_draw_ms) >= 120) {
+            s_last_upd_draw_ms = now_ms;
+            draw_ui();
+        }
+
+        last_btn_a = btn_a;
+        last_btn_b = btn_b;
+        enc_is_pressed = btn_enc;
+        return;
+    }
+
     // ========================================================
     // 3. Мигание курсора
     // ========================================================
@@ -2271,6 +2625,12 @@ void ui_update() {
         	    }
         	    ui_needs_redraw = true;
         	}
+        	else if (s_current_mode == MODE_SETTINGS) {
+        	    s_settings_idx += effective;
+        	    if (s_settings_idx < 0) s_settings_idx = 0;
+        	    if (s_settings_idx >= 4) s_settings_idx = 3;
+        	    ui_needs_redraw = true;
+        	}
             else if (s_current_mode == MODE_STATIONS) {
                 const catalog_category_t* ec = catalog_get_category(s_selected_category);
                 int station_count = ec ? (int)ec->count : 0;
@@ -2319,11 +2679,25 @@ void ui_update() {
 
                 ui_needs_redraw = true;
             }
-            else if (s_current_mode == MODE_SETTINGS || s_current_mode == MODE_CATALOG) {
+            else if (s_current_mode == MODE_CATALOG) {
+                if (s_catalog_submode == 1) {
+                    int nsrc = 0;
+                    catalog_updater_get_sources(&nsrc);
+                    s_upd_source_idx += effective;
+                    if (s_upd_source_idx < 0) s_upd_source_idx = 0;
+                    if (nsrc > 0 && s_upd_source_idx >= nsrc) s_upd_source_idx = nsrc - 1;
+                    ui_needs_redraw = true;
+                } else {
+                    s_settings_idx += effective;
+                    if (s_settings_idx < 0) s_settings_idx = 0;
+                    if (s_settings_idx >= 7) s_settings_idx = 6;   // 7 пунктов: 0..6
+                    ui_needs_redraw = true;
+                }
+            }
+            else if (s_current_mode == MODE_SETTINGS) {
                 s_settings_idx += effective;
                 if (s_settings_idx < 0) s_settings_idx = 0;
-                if (s_current_mode == MODE_SETTINGS && s_settings_idx >= 4) s_settings_idx = 3;
-                if (s_current_mode == MODE_CATALOG && s_settings_idx >= 6) s_settings_idx = 5; // <-- ИЗМЕНЕНО
+                if (s_settings_idx >= 4) s_settings_idx = 3;       // 4 пункта: 0..3
                 ui_needs_redraw = true;
             }
             else if (s_current_mode == MODE_WIFI && !s_keyboard_active) {
@@ -2403,8 +2777,28 @@ void ui_update() {
         else if (s_current_mode == MODE_FAVORITES) {
             s_current_mode = MODE_PLAYBACK;
         }
-        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
+        else if (s_current_mode == MODE_ABOUT) {
             s_current_mode = MODE_SETTINGS;
+        }
+        else if (s_current_mode == MODE_CATALOG) {
+            catalog_updater_phase_t uph = catalog_updater_get_phase();
+
+            if (uph == UPD_ASK_VALIDATE) {
+                catalog_updater_confirm_validate(false);   // A = применить сразу (без валидации)
+            }
+            else if (uph == UPD_DONE || uph == UPD_ERROR) {
+                catalog_updater_reset();                   // фаза -> IDLE, экран меню вернётся
+                s_catalog_submode = 0;                     // гарантируем: не в подменю
+                s_settings_idx    = 5;                     // подсветим «6. Обновить из сети»
+                s_upd_refuse_ms   = 0;                     // сброс тоста отказа
+                ESP_LOGI(TAG, "Updater dismissed, back to catalog menu");
+            }
+            else if (s_catalog_submode == 1) {
+                s_catalog_submode = 0;                     // A = назад из подменю в меню
+            }
+            else {
+                s_current_mode = MODE_SETTINGS;            // обычный выход из каталога
+            }
         }
 
         s_encoder_accumulator = 0;
@@ -2439,10 +2833,22 @@ void ui_update() {
         else if (s_current_mode == MODE_SETTINGS) {
             s_current_mode = MODE_PLAYBACK;
         }
-        else if (s_current_mode == MODE_ABOUT || s_current_mode == MODE_CATALOG) {
+        else if (s_current_mode == MODE_ABOUT) {
             s_current_mode = MODE_SETTINGS;
         }
+        else if (s_current_mode == MODE_CATALOG) {
+            catalog_updater_phase_t uph = catalog_updater_get_phase();
 
+            if (uph == UPD_ASK_VALIDATE) {
+                catalog_updater_confirm_validate(true);    // B = проверить
+            }
+            else if (s_catalog_submode == 1) {
+                // B уже обработан в btn_enc (старт). Здесь ничего.
+            }
+            else {
+                s_current_mode = MODE_PLAYBACK;            // обычный переход
+            }
+        }
         s_encoder_accumulator = 0;
         ui_needs_redraw = true;
     }
@@ -2473,20 +2879,35 @@ void ui_update() {
                 }
                 else if (s_current_mode == MODE_FAVORITES) {
                     int global_idx = catalog_get_favorite_global_index(s_fav_station_idx);
-                    const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
 
-                    if (st != nullptr) {
-                        bool added = catalog_toggle_favorite(st->id);
-                        catalog_save_favorites();
-                        ESP_LOGI(TAG, "Favorite %s: %s", added ? "ADDED" : "REMOVED", st->name);
+                    if (global_idx < 0) {
+                        // === «Пенёчек»: станция удалена из каталога. Удаляем закладку по индексу. ===
+                        if (catalog_remove_favorite_at_index(s_fav_station_idx)) {
+                            catalog_save_favorites();
+                            ESP_LOGI(TAG, "Removed orphaned favorite at index %d", s_fav_station_idx);
 
-                        if (!added) {
                             int fav_count = (int)catalog_get_favorites_count();
-
                             if (s_fav_station_idx >= fav_count && fav_count > 0) {
                                 s_fav_station_idx = fav_count - 1;
                             } else if (fav_count == 0) {
                                 s_fav_station_idx = 0;
+                            }
+                        }
+                    } else {
+                        // === Живая станция: обычный toggle (удаление из избранного). ===
+                        const catalog_station_t* st = catalog_get_station_by_global_index(global_idx);
+                        if (st != nullptr) {
+                            bool added = catalog_toggle_favorite(st->id);
+                            catalog_save_favorites();
+                            ESP_LOGI(TAG, "Favorite %s: %s", added ? "ADDED" : "REMOVED", st->name);
+
+                            if (!added) {
+                                int fav_count = (int)catalog_get_favorites_count();
+                                if (s_fav_station_idx >= fav_count && fav_count > 0) {
+                                    s_fav_station_idx = fav_count - 1;
+                                } else if (fav_count == 0) {
+                                    s_fav_station_idx = 0;
+                                }
                             }
                         }
                     }
@@ -2494,8 +2915,31 @@ void ui_update() {
                 else if (s_current_mode == MODE_WIFI) {
                     wifi_back_action();
                 }
+                else if (s_current_mode == MODE_PLAYBACK) {
+                    // E5: toggle favorite текущей играющей станции
+                    if (s_playing_station_gidx >= 0) {
+                        const catalog_station_t* st =
+                            catalog_get_station_by_global_index(
+                                (size_t)s_playing_station_gidx);
+
+                        if (st != nullptr) {
+                            bool added = catalog_toggle_favorite(st->id);
+                            catalog_save_favorites();
+
+                            ESP_LOGI(TAG, "Favorite %s: %s (from PLAY)",
+                                     added ? "ADDED" : "REMOVED", st->name);
+
+                            s_fav_toast_ms =
+                                (uint32_t)(esp_timer_get_time() / 1000);
+                            strlcpy(s_fav_toast_text,
+                                    added ? "* In Favorites"
+                                          : "- From Favorites",
+                                    sizeof(s_fav_toast_text));
+                        }
+                    }
+                }
                 else {
-                    // В остальных режимах долгое нажатие = MUTE
+                    // MUTE в остальных режимах (STA, FAV, CAT, SET, ABOUT, WIFI)
                     s_is_muted = !s_is_muted;
                     s_pending_event = UI_EVENT_MUTE_TOGGLED;
                 }
@@ -2536,6 +2980,7 @@ void ui_update() {
                 	                ESP_LOGI(TAG, "Deleting %d marked stations...", (int)s_marked_count);
                 	                catalog_remove_stations(s_marked_ids, s_marked_count);
                 	                clear_marks();
+                	                s_cat_saved_ms = (uint32_t)(esp_timer_get_time() / 1000);   //
                 	                // Корректируем индекс, если вышли за границы
                 	                const catalog_category_t* new_cat = catalog_get_category(s_selected_category);
                 	                int new_count = new_cat ? (int)new_cat->count : 0;
@@ -2584,6 +3029,7 @@ void ui_update() {
                                     ESP_LOGI(TAG, "Deleting %d marked categories...", (int)s_marked_cat_count);
                                     catalog_remove_categories(s_marked_cat_indices, s_marked_cat_count);
                                     clear_cat_marks();
+                                    s_cat_saved_ms = (uint32_t)(esp_timer_get_time() / 1000);   //
                                     // Корректируем индекс, если вышли за границы
                                     int new_count = (int)catalog_category_count();
                                     if (s_selected_category >= new_count) {
@@ -2610,8 +3056,7 @@ void ui_update() {
                         }
                         else if (s_settings_idx == 1) {
                             s_current_mode = MODE_CATALOG;
-                            s_settings_idx = 0; // Сбрасываем индекс для подменю
-
+                            s_settings_idx = 0;
                             // Автоматическая загрузка рабочего каталога при входе
                             if (!catalog_is_validating() && !catalog_is_deep_validating() && !catalog_is_merging()) {
                                 if (catalog_get_staging_count() == 0) {
@@ -2627,8 +3072,22 @@ void ui_update() {
                             s_current_mode = MODE_PLAYBACK;
                         }
                     }
-
                     else if (s_current_mode == MODE_CATALOG) {
+                        // === ПОДСМЕНЮ: нажатие = запуск updater ===
+                        if (s_catalog_submode == 1) {
+                            const upd_source_t* srcs = NULL; int nsrc = 0;
+                            srcs = catalog_updater_get_sources(&nsrc);
+
+                            if (nsrc > 0 && s_upd_source_idx < nsrc) {
+                                if (catalog_updater_start(srcs[s_upd_source_idx].cc)) {
+                                    s_catalog_submode = 0;
+                                    ESP_LOGI(TAG, "Updater launched for '%s'", srcs[s_upd_source_idx].cc);
+                                } else {
+                                    s_upd_refuse_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                                    ESP_LOGW(TAG, "Updater start refused (busy/no network)");
+                                }
+                            }
+                        }
                         if (s_settings_idx == 0) {
                             ESP_LOGI(TAG, "Catalog: Importing M3U from SD...");
                             catalog_staging_load_from_m3u_dir(CATALOG_M3U_DIR);
@@ -2650,6 +3109,13 @@ void ui_update() {
                             catalog_purge_dead_stations();
                         }
                         else if (s_settings_idx == 5) {
+                            // Пункт "6. Обновить из сети" → подменю
+                            s_catalog_submode = 1;
+                            s_upd_source_idx = 0;
+                            ESP_LOGI(TAG, "Catalog update submode entered");
+                        }
+                        else if (s_settings_idx == 6) {
+                            // "7. Назад"
                             s_current_mode = MODE_SETTINGS;
                             s_settings_idx = 1;
                         }
@@ -2855,4 +3321,9 @@ void ui_set_stream_meta(const char* icy_name,
 void ui_set_switch_phase(int phase)
 {
     s_switch_phase = phase;
+}
+
+void ui_set_playing_station(int global_index)
+{
+    s_playing_station_gidx = global_index;
 }

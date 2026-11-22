@@ -32,6 +32,9 @@ static char s_stream_title[128] = "Connecting...";
 static int s_metaint = 0;
 static char s_http_last_url[256] = {0};
 
+static volatile bool s_stream_unsupported = false;
+static char          s_unsupported_reason[16] = "";
+
 // === ICY metadata from HTTP headers ===
 static char g_station_name[64] = "";
 static int  g_icy_br_kbps = 0;
@@ -39,6 +42,18 @@ static char g_content_type[32] = "";
 
 static uint32_t s_current_station_id = 0;
 
+
+static volatile bool s_stream_failed   = false;  // читается из main loop — volatile обязателен
+static int           s_consec_failures = 0;      // трогает только http_read_task
+static uint32_t      s_bytes_session   = 0;      // трогает только http_read_task
+
+// Лимиты неудач подряд до признания станции мёртвой.
+// Если станция НИКОГДА не играла в этой сессии — падаем быстро.
+// Если играла и умерла mid-play — даём сети оправиться.
+static const int FAIL_LIMIT_NO_AUDIO = 3;   // ~1+2+4 = 7 с
+static const int FAIL_LIMIT_HAD_AUDIO = 5;  // ~1+2+4+8+8 = 23 с
+
+static const char* detect_unsupported_codec(const char* ct, const char* url);
 
 // =====================================================================
 // 1. Полный валидатор UTF-8 (любой, не только русский)
@@ -212,9 +227,14 @@ static void http_clear_ringbuf(void) {
 
 static void http_read_task(void *pvParameters) {
     const char *url = (const char *)pvParameters;
-
     s_http_task_running = true;
     ESP_LOGI(TAG, "HTTP task started, URL: %s", url);
+
+    s_consec_failures = 0;
+    s_bytes_session   = 0;
+    s_stream_failed   = false;
+    s_stream_unsupported = false;
+    s_unsupported_reason[0] = '\0';
 
     uint8_t *net_buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (net_buf == NULL) {
@@ -232,7 +252,7 @@ static void http_read_task(void *pvParameters) {
     int bytes_until_meta = 0;
     int meta_bytes_remaining = 0;
     int meta_buf_pos = 0;
-    char meta_buf[256] = {};
+    char meta_buf[1024] = {};
 
     while (s_http_task_running && !s_force_stop) {
         if (client == NULL) {
@@ -241,14 +261,22 @@ static void http_read_task(void *pvParameters) {
             config.buffer_size = 4096;
             config.crt_bundle_attach = esp_crt_bundle_attach;
             config.timeout_ms = 10000;
-            // ============================
-            config.user_agent = "WinampMPEG/5.0"; // Или "VLC/3.0.0 LibVLC/3.0.0"
-            // ============================
+            config.user_agent = "WinampMPEG/5.0";
             config.event_handler = http_event_handler;
 
             client = esp_http_client_init(&config);
             if (client == NULL) {
                 ESP_LOGW(TAG, "HTTP client init failed, retry in %d ms", retry_delay_ms);
+
+                s_consec_failures++;
+                int limit = (s_bytes_session > 0) ? FAIL_LIMIT_HAD_AUDIO : FAIL_LIMIT_NO_AUDIO;
+                if (s_consec_failures >= limit) {
+                    ESP_LOGE(TAG, "Persistent init failure (%d/%d), giving up",
+                             s_consec_failures, limit);
+                    s_stream_failed = true;
+                    break;
+                }
+
                 http_interruptible_delay(retry_delay_ms);
                 if (s_force_stop) break;
                 if (retry_delay_ms < 8000) retry_delay_ms *= 2;
@@ -260,23 +288,47 @@ static void http_read_task(void *pvParameters) {
             if (esp_http_client_open(client, 0) != ESP_OK) {
                 ESP_LOGW(TAG, "HTTP open failed, retry in %d ms", retry_delay_ms);
 
-
-            if (s_current_station_id > 0) {
-            	catalog_health_on_error(s_current_station_id);
-            }
-
+                if (s_current_station_id > 0) {
+                    catalog_health_on_error(s_current_station_id);
+                }
 
                 esp_http_client_cleanup(client);
                 client = NULL;
 
+                s_consec_failures++;
+                int limit = (s_bytes_session > 0) ? FAIL_LIMIT_HAD_AUDIO : FAIL_LIMIT_NO_AUDIO;
+                if (s_consec_failures >= limit) {
+                    ESP_LOGE(TAG, "Persistent open failure (%d/%d), giving up on station 0x%08lx",
+                             s_consec_failures, limit, (unsigned long)s_current_station_id);
+                    s_stream_failed = true;
+                    break;
+                }
+
                 http_interruptible_delay(retry_delay_ms);
                 if (s_force_stop) break;
-
                 if (retry_delay_ms < 8000) retry_delay_ms *= 2;
                 continue;
             }
 
             esp_http_client_fetch_headers(client);
+
+            // === E4-v1: неподдерживаемый формат → выходим ДО того, как解码器 начнёт сходить с ума ===
+            const char* bad_codec = detect_unsupported_codec(g_content_type, url);
+            if (bad_codec != nullptr) {
+                ESP_LOGW(TAG, "Unsupported codec '%s' for station 0x%08lx: ct='%s' — bailing out",
+                         bad_codec,
+                         (unsigned long)s_current_station_id,
+                         g_content_type[0] ? g_content_type : "(empty)");
+                s_stream_unsupported = true;
+                strncpy(s_unsupported_reason, bad_codec, sizeof(s_unsupported_reason) - 1);
+                s_unsupported_reason[sizeof(s_unsupported_reason) - 1] = '\0';
+
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                client = NULL;
+                break;
+            }
+            // =====================================================================================
 
             state = STATE_AUDIO;
             bytes_until_meta = s_metaint;
@@ -284,13 +336,13 @@ static void http_read_task(void *pvParameters) {
             meta_buf_pos = 0;
             memset(meta_buf, 0, sizeof(meta_buf));
 
-            retry_delay_ms = 1000;
+            // ВАЖНО: retry_delay_ms здесь НЕ сбрасываем.
+            // Сброс backoff — только когда реально пришли байты аудио (ниже).
             ESP_LOGI(TAG, "HTTP connected, metaint=%d", s_metaint);
 
             if (s_current_station_id > 0) {
                 catalog_health_on_stable(s_current_station_id);
             }
-
         }
 
         if (s_force_stop) break;
@@ -307,14 +359,25 @@ static void http_read_task(void *pvParameters) {
             esp_http_client_cleanup(client);
             client = NULL;
 
+            s_consec_failures++;
+            int limit = (s_bytes_session > 0) ? FAIL_LIMIT_HAD_AUDIO : FAIL_LIMIT_NO_AUDIO;
+            if (s_consec_failures >= limit) {
+                ESP_LOGE(TAG, "Persistent read failure (%d/%d), giving up on station 0x%08lx",
+                         s_consec_failures, limit, (unsigned long)s_current_station_id);
+                s_stream_failed = true;
+                break;
+            }
+
             http_interruptible_delay(retry_delay_ms);
             if (s_force_stop) break;
-
             if (retry_delay_ms < 8000) retry_delay_ms *= 2;
             continue;
         }
 
+        // Аудио реально потекло — единственный корректный момент для сброса.
         retry_delay_ms = 1000;
+        s_consec_failures = 0;
+        s_bytes_session += (uint32_t)read_len;
 
         int offset = 0;
 
@@ -324,33 +387,34 @@ static void http_read_task(void *pvParameters) {
             while (offset < read_len) {
                 if (state == STATE_AUDIO) {
                     int chunk = (read_len - offset < bytes_until_meta)
-                                    ? (read_len - offset)
-                                    : bytes_until_meta;
-
+                                ? (read_len - offset)
+                                : bytes_until_meta;
                     xRingbufferSend(s_ringbuf, net_buf + offset, chunk, pdMS_TO_TICKS(100));
-
                     offset += chunk;
                     bytes_until_meta -= chunk;
-
                     if (bytes_until_meta == 0) {
                         state = STATE_META_LEN;
                         meta_buf_pos = 0;
                     }
-                } else if (state == STATE_META_LEN) {
+                }
+                else if (state == STATE_META_LEN) {
                     meta_bytes_remaining = net_buf[offset++] * 16;
                     state = (meta_bytes_remaining == 0) ? STATE_AUDIO : STATE_META_DATA;
-
                     if (state == STATE_AUDIO) {
                         bytes_until_meta = s_metaint;
                     }
-                } else {
+                }
+                else { // STATE_META_DATA
                     int to_copy = (read_len - offset < meta_bytes_remaining)
-                                      ? (read_len - offset)
-                                      : meta_bytes_remaining;
+                                  ? (read_len - offset)
+                                  : meta_bytes_remaining;
 
-                    if (meta_buf_pos + to_copy < 255) {
-                        memcpy(meta_buf + meta_buf_pos, net_buf + offset, to_copy);
-                        meta_buf_pos += to_copy;
+                    // Clamp: копируем сколько влезает, остаток просто пропускаем
+                    int space = (int)sizeof(meta_buf) - 1 - meta_buf_pos;
+                    int actual_copy = (to_copy < space) ? to_copy : space;
+                    if (actual_copy > 0) {
+                        memcpy(meta_buf + meta_buf_pos, net_buf + offset, actual_copy);
+                        meta_buf_pos += actual_copy;
                     }
 
                     offset += to_copy;
@@ -359,6 +423,28 @@ static void http_read_task(void *pvParameters) {
                     if (meta_bytes_remaining == 0) {
                         meta_buf[meta_buf_pos] = '\0';
 
+                        // Откат хвоста к последней полной границе UTF-8-символа.
+                        // Без этого обрезанный посреди символа title ложно
+                        // не проходит is_valid_utf8() и конвертируется как CP1251.
+                        {
+                            int i = 0, last_good = 0;
+                            const unsigned char* b = (const unsigned char*)meta_buf;
+                            while (i < meta_buf_pos) {
+                                unsigned char c = b[i];
+                                int len;
+                                if      (c < 0x80)                len = 1;
+                                else if ((c & 0xE0) == 0xC0)      len = 2;
+                                else if ((c & 0xF0) == 0xE0)      len = 3;
+                                else if ((c & 0xF8) == 0xF0)      len = 4;
+                                else                              len = 1;
+                                if (i + len > meta_buf_pos) break; // неполный символ в хвосте
+                                i += len;
+                                last_good = i;
+                            }
+                            meta_buf_pos = last_good;
+                            meta_buf[meta_buf_pos] = '\0';
+                        }
+
                         char *t = strstr(meta_buf, "StreamTitle='");
                         if (t) {
                             t += 13;
@@ -366,20 +452,17 @@ static void http_read_task(void *pvParameters) {
                             if (e) {
                                 int l = e - t;
                                 if (l > 127) l = 127;
-
                                 char temp_title[128];
                                 memcpy(temp_title, t, l);
                                 temp_title[l] = '\0';
 
                                 const char* src_title = skip_utf8_bom(temp_title);
-
                                 if (is_valid_utf8(src_title)) {
                                     strncpy(s_stream_title, src_title, sizeof(s_stream_title) - 1);
                                     s_stream_title[sizeof(s_stream_title) - 1] = '\0';
                                 } else {
                                     cp1251_to_utf8_full(src_title, s_stream_title, sizeof(s_stream_title));
                                 }
-
                                 ESP_LOGI(TAG, "StreamTitle: %s", s_stream_title);
                             }
                         }
@@ -398,7 +481,6 @@ static void http_read_task(void *pvParameters) {
     }
 
     free(net_buf);
-
     ESP_LOGI(TAG, "HTTP task exiting");
     s_http_task_running = false;
     s_http_task_handle = NULL;
@@ -472,6 +554,10 @@ static void http_stream_start_unlocked(const char *url) {
     s_force_stop = false;
     s_metaint = 0;
     strcpy(s_stream_title, "Connecting...");
+
+    s_stream_failed   = false;
+    s_consec_failures = 0;
+    s_bytes_session   = 0;
 
     http_clear_ringbuf();
 
@@ -581,4 +667,52 @@ int http_stream_get_bitrate(void) {
 
 const char* http_stream_get_content_type(void) {
     return g_content_type;
+}
+
+bool http_stream_is_failed(void) {
+    return s_stream_failed;
+}
+
+void http_stream_clear_failed(void) {
+    s_stream_failed = false;
+}
+
+/**
+ * Возвращает метку кодека, если поток заведомо не декодируется Helix MP3
+ * (AAC+/AAC/MP4/FLAC/OGG/OPUS), иначе nullptr.
+ * Основной признак — Content-Type из ICY-заголовков; запасной — суффикс URL
+ * (многие Icecast-серверы для aacp вообще не шлют content-type).
+ */
+static const char* detect_unsupported_codec(const char* ct, const char* url)
+{
+    if (ct && ct[0]) {
+        if (strcasestr(ct, "aacp"))   return "AAC+";
+        if (strcasestr(ct, "aac"))    return "AAC";
+        if (strcasestr(ct, "mp4"))    return "MP4";
+        if (strcasestr(ct, "flac"))   return "FLAC";
+        if (strcasestr(ct, "vorbis")) return "OGG";
+        if (strcasestr(ct, "opus"))   return "OPUS";
+        if (strcasestr(ct, "ogg"))    return "OGG";
+    }
+    if (url && url[0]) {
+        if (strcasestr(url, ".aacp")) return "AAC+";
+        if (strcasestr(url, ".aac"))  return "AAC";
+        if (strcasestr(url, ".flac")) return "FLAC";
+        if (strcasestr(url, ".ogg"))  return "OGG";
+        if (strcasestr(url, ".opus")) return "OPUS";
+    }
+    return nullptr;
+}
+
+bool http_stream_is_unsupported(void) {
+    return s_stream_unsupported;
+}
+
+const char* http_stream_get_unsupported_reason(void) {
+    return s_unsupported_reason;
+}
+
+void http_stream_clear_unsupported(void) {
+    s_stream_unsupported = false;
+    s_unsupported_reason[0] = '\0';
 }

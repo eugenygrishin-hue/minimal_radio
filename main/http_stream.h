@@ -33,6 +33,21 @@ const char* http_stream_get_content_type(void);
  */
 void http_stream_drain_ringbuf(void);
 
+/** true, если поток устойчиво умер (лимит неудач исчерпан) и задача вышла. */
+bool http_stream_is_failed(void);
+
+/** Сбрасывает флаг неудачи (main loop вызывает после обработки fallback). */
+void http_stream_clear_failed(void);
+
+/** true, если поток живой, но формат не поддерживается декодером (AAC+ и т.п.). */
+bool http_stream_is_unsupported(void);
+
+/** Причина в короткой строке, напр. "AAC+". Пуста, если unsupported == false. */
+const char* http_stream_get_unsupported_reason(void);
+
+/** Сброс флага после обработки main loop. */
+void http_stream_clear_unsupported(void);
+
 #ifdef __cplusplus
 }
 #endif

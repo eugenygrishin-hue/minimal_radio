@@ -2521,3 +2521,53 @@ void catalog_health_on_stable(uint32_t station_id)
         st->last_checked = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     }
 }
+
+bool catalog_remove_favorite_at_index(int fav_idx)
+{
+    if (fav_idx < 0 || fav_idx >= (int)g_catalog.favorite_count) {
+        return false;
+    }
+
+    // Сдвигаем хвост массива влево
+    for (int i = fav_idx; i < (int)g_catalog.favorite_count - 1; i++) {
+        g_catalog.favorite_ids[i] = g_catalog.favorite_ids[i + 1];
+    }
+    g_catalog.favorite_count--;
+
+    return true;
+}
+
+bool catalog_staging_add_station(uint32_t id,
+                                 const char* name,
+                                 const char* url,
+                                 uint16_t bitrate,
+                                 const char* group)
+{
+    if (name == nullptr || url == nullptr) return false;
+    if (name[0] == '\0' || url[0] == '\0') return false;
+    if (strlen(name) > CATALOG_MAX_NAME_LEN || strlen(url) > CATALOG_MAX_URL_LEN) return false;
+
+    // Дедупликация по ID относительно STAGING (не working!)
+    for (size_t i = 0; i < s_staging_count; i++) {
+        if (s_staging[i].id == id) return false;
+    }
+
+    staging_ensure_capacity(s_staging_count + 1);
+    if (s_staging_count >= s_staging_capacity) return false;
+
+    staging_station_t* ss = &s_staging[s_staging_count++];
+    memset(ss, 0, sizeof(*ss));
+
+    ss->id = id;
+    copy_trunc(ss->name, sizeof(ss->name), name);
+    copy_trunc(ss->url, sizeof(ss->url), url);
+    copy_trunc(ss->group, sizeof(ss->group), (group && group[0]) ? group : "Imported");
+    ss->bitrate_kbps = bitrate;
+    ss->status = CAT_STATUS_UNKNOWN;
+    ss->last_checked = 0;
+    ss->last_deep_checked = 0;
+    ss->fail_count = 0;
+    ss->consecutive_failures = 0;
+
+    return true;
+}
